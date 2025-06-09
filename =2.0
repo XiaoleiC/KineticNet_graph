@@ -1,0 +1,40 @@
+Collecting packaging
+  Downloading packaging-25.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting pandas
+  Downloading pandas-2.2.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (89 kB)
+Collecting pydantic
+  Downloading pydantic-2.11.3-py3-none-any.whl.metadata (65 kB)
+Collecting pyyaml
+  Downloading PyYAML-6.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (2.1 kB)
+Requirement already satisfied: numpy>=1.26.0 in /home/xlc_wsl2/miniconda3/envs/deepgraphlearning/lib/python3.12/site-packages (from pandas) (2.0.1)
+Collecting python-dateutil>=2.8.2 (from pandas)
+  Downloading python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+Collecting pytz>=2020.1 (from pandas)
+  Downloading pytz-2025.2-py2.py3-none-any.whl.metadata (22 kB)
+Collecting tzdata>=2022.7 (from pandas)
+  Downloading tzdata-2025.2-py2.py3-none-any.whl.metadata (1.4 kB)
+Collecting annotated-types>=0.6.0 (from pydantic)
+  Downloading annotated_types-0.7.0-py3-none-any.whl.metadata (15 kB)
+Collecting pydantic-core==2.33.1 (from pydantic)
+  Downloading pydantic_core-2.33.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.8 kB)
+Requirement already satisfied: typing-extensions>=4.12.2 in /home/xlc_wsl2/miniconda3/envs/deepgraphlearning/lib/python3.12/site-packages (from pydantic) (4.13.2)
+Collecting typing-inspection>=0.4.0 (from pydantic)
+  Downloading typing_inspection-0.4.0-py3-none-any.whl.metadata (2.6 kB)
+Collecting six>=1.5 (from python-dateutil>=2.8.2->pandas)
+  Downloading six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Downloading packaging-25.0-py3-none-any.whl (66 kB)
+Downloading pandas-2.2.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (12.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12.7/12.7 MB 20.5 MB/s eta 0:00:00
+Downloading pydantic-2.11.3-py3-none-any.whl (443 kB)
+Downloading pydantic_core-2.33.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.0/2.0 MB 17.2 MB/s eta 0:00:00
+Downloading PyYAML-6.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (767 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 767.5/767.5 kB 11.0 MB/s eta 0:00:00
+Downloading annotated_types-0.7.0-py3-none-any.whl (13 kB)
+Downloading python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+Downloading pytz-2025.2-py2.py3-none-any.whl (509 kB)
+Downloading typing_inspection-0.4.0-py3-none-any.whl (14 kB)
+Downloading tzdata-2025.2-py2.py3-none-any.whl (347 kB)
+Downloading six-1.17.0-py2.py3-none-any.whl (11 kB)
+Installing collected packages: pytz, tzdata, typing-inspection, six, pyyaml, pydantic-core, packaging, annotated-types, python-dateutil, pydantic, pandas
+Successfully installed annotated-types-0.7.0 packaging-25.0 pandas-2.2.3 pydantic-2.11.3 pydantic-core-2.33.1 python-dateutil-2.9.0.post0 pytz-2025.2 pyyaml-6.0.2 six-1.17.0 typing-inspection-0.4.0 tzdata-2025.2
