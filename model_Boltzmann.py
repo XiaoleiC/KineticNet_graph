@@ -1,230 +1,371 @@
-import dgl
-import dgl.function as fn
-import dgl.nn as dglnn
-import numpy as np
-import scipy.sparse as sparse
 import torch
 import torch.nn as nn
-from dgl.base import DGLError
-from dgl.nn.functional import edge_softmax
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+from dgl.nn.pytorch import GraphConv
+from boltzmann import VelocitySet, CollisionOperator, FlowWeightCalculator, BoltzmannUpdater, MomentDecoder
 
 
-class GraphGRUCell(nn.Module):
-    """Graph GRU unit which can use any message passing
-    net to replace the linear layer in the original GRU
-    Parameter
-    ==========
-    in_feats : int
-        number of input features
-
-    out_feats : int
-        number of output features
-
-    net : torch.nn.Module
-        message passing network
+class DiffusionGraphConv(nn.Module):
     """
-
-    def __init__(self, in_feats, out_feats, net):
-        super(GraphGRUCell, self).__init__()
+    Diffusion graph convolution layer.
+    """
+    def __init__(self, in_feats, out_feats, num_hops):
+        super(DiffusionGraphConv, self).__init__()
+        self.num_hops = num_hops
         self.in_feats = in_feats
         self.out_feats = out_feats
-        self.dir = dir
-        # net can be any GNN model
-        self.r_net = net(in_feats + out_feats, out_feats)
-        self.u_net = net(in_feats + out_feats, out_feats)
-        self.c_net = net(in_feats + out_feats, out_feats)
-        # Manually add bias Bias
-        self.r_bias = nn.Parameter(torch.rand(out_feats))
-        self.u_bias = nn.Parameter(torch.rand(out_feats))
-        self.c_bias = nn.Parameter(torch.rand(out_feats))
-
-    def forward(self, g, x, h):
-        r = torch.sigmoid(self.r_net(g, torch.cat([x, h], dim=1)) + self.r_bias)
-        u = torch.sigmoid(self.u_net(g, torch.cat([x, h], dim=1)) + self.u_bias)
-        h_ = r * h
-        c = torch.sigmoid(
-            self.c_net(g, torch.cat([x, h_], dim=1)) + self.c_bias
-        )
-        new_h = u * h + (1 - u) * c
-        return new_h
+        
+        # Learnable weights for each hop
+        self.linear = nn.Linear(in_feats * (num_hops + 1), out_feats)
+        
+    def forward(self, graph, feat):
+        """
+        Args:
+            graph: DGL graph
+            feat: Input features [N, in_feats]
+        Returns:
+            Output features [N, out_feats]
+        """
+        graph = graph.local_var()
+        
+        # Normalize adjacency matrix
+        degs = graph.in_degrees().float().clamp(min=1)
+        norm = torch.pow(degs, -0.5)
+        graph.ndata['norm'] = norm.unsqueeze(1)
+        
+        feat_list = [feat]  # 0-hop (self)
+        
+        # Multi-hop diffusion
+        graph.ndata['h'] = feat
+        for _ in range(self.num_hops):
+            graph.update_all(fn.u_mul_e('h', 'norm', 'm'), fn.sum('m', 'h_new'))
+            graph.ndata['h'] = graph.ndata['h_new'] * graph.ndata['norm']
+            feat_list.append(graph.ndata['h'])
+        
+        # Concatenate all hops
+        feat_concat = torch.cat(feat_list, dim=-1)  # [N, in_feats * (num_hops + 1)]
+        
+        return self.linear(feat_concat)
 
 
 class StackedEncoder(nn.Module):
-    """One step encoder unit for hidden representation generation
-    it can stack multiple vertical layers to increase the depth.
-
-    Parameter
-    ==========
-    in_feats : int
-        number if input features
-
-    out_feats : int
-        number of output features
-
-    num_layers : int
-        vertical depth of one step encoding unit
-
-    net : torch.nn.Module
-        message passing network for graph computation
     """
-
-    def __init__(self, in_feats, out_feats, num_layers, net):
+    Modified encoder that lifts macroscale variables to mesoscale (Q dimensions).
+    """
+    def __init__(self, input_dim, velocity_set, hidden_dim=64, num_layers=2, num_hops=2):
         super(StackedEncoder, self).__init__()
-        self.in_feats = in_feats
-        self.out_feats = out_feats
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.net = net
+        self.Q = velocity_set.Q  # Number of velocity components
+        
+        # Graph convolution layers
         self.layers = nn.ModuleList()
-        if self.num_layers <= 0:
-            raise DGLError("Layer Number must be greater than 0! ")
-        self.layers.append(
-            GraphGRUCell(self.in_feats, self.out_feats, self.net)
-        )
-        for _ in range(self.num_layers - 1):
-            self.layers.append(
-                GraphGRUCell(self.out_feats, self.out_feats, self.net)
-            )
-
-    # hidden_states should be a list which for different layer
-    def forward(self, g, x, hidden_states):
-        hiddens = []
+        
+        # First layer: input_dim -> hidden_dim
+        self.layers.append(DiffusionGraphConv(input_dim, hidden_dim, num_hops))
+        
+        # Hidden layers: hidden_dim -> hidden_dim
+        for _ in range(num_layers - 2):
+            self.layers.append(DiffusionGraphConv(hidden_dim, hidden_dim, num_hops))
+        
+        # Last layer: hidden_dim -> Q (mesoscale)
+        if num_layers > 1:
+            self.layers.append(DiffusionGraphConv(hidden_dim, self.Q, num_hops))
+        else:
+            # If only one layer, direct mapping
+            self.layers[0] = DiffusionGraphConv(input_dim, self.Q, num_hops)
+        
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, graph, inputs):
+        """
+        Args:
+            graph: DGL graph
+            inputs: Input features [batch_size, N, input_dim]
+        Returns:
+            Mesoscale distribution [batch_size, N, Q]
+        """
+        batch_size, num_nodes, _ = inputs.shape
+        
+        # Reshape for processing: [batch_size * N, input_dim]
+        x = inputs.view(-1, self.input_dim)
+        
+        # Create batched graph
+        if batch_size > 1:
+            batched_graph = dgl.batch([graph] * batch_size)
+        else:
+            batched_graph = graph
+        
+        # Apply graph convolution layers
         for i, layer in enumerate(self.layers):
-            x = layer(g, x, hidden_states[i])
-            hiddens.append(x)
-        return x, hiddens
+            x = layer(batched_graph, x)
+            if i < len(self.layers) - 1:  # No activation on last layer
+                x = F.relu(x)
+                x = self.dropout(x)
+        
+        # Ensure non-negativity (physical constraint for distribution)
+        x = F.softplus(x)
+        
+        # Reshape back: [batch_size, N, Q]
+        x = x.view(batch_size, num_nodes, self.Q)
+        
+        return x
 
 
-class StackedDecoder(nn.Module):
-    """One step decoder unit for hidden representation generation
-    it can stack multiple vertical layers to increase the depth.
-
-    Parameter
-    ==========
-    in_feats : int
-        number if input features
-
-    hid_feats : int
-        number of feature before the linear output layer
-
-    out_feats : int
-        number of output features
-
-    num_layers : int
-        vertical depth of one step encoding unit
-
-    net : torch.nn.Module
-        message passing network for graph computation
+class BoltzmannCell(nn.Module):
     """
-
-    def __init__(self, in_feats, hid_feats, out_feats, num_layers, net):
-        super(StackedDecoder, self).__init__()
-        self.in_feats = in_feats
-        self.hid_feats = hid_feats
-        self.out_feats = out_feats
-        self.num_layers = num_layers
-        self.net = net
-        self.out_layer = nn.Linear(self.hid_feats, self.out_feats)
-        self.layers = nn.ModuleList()
-        if self.num_layers <= 0:
-            raise DGLError("Layer Number must be greater than 0!")
-        self.layers.append(GraphGRUCell(self.in_feats, self.hid_feats, net))
-        for _ in range(self.num_layers - 1):
-            self.layers.append(
-                GraphGRUCell(self.hid_feats, self.hid_feats, net)
-            )
-
-    def forward(self, g, x, hidden_states):
-        hiddens = []
-        for i, layer in enumerate(self.layers):
-            x = layer(g, x, hidden_states[i])
-            hiddens.append(x)
-        x = self.out_layer(x)
-        return x, hiddens
-
-
-class GraphRNN(nn.Module):
-    """Graph Sequence to sequence prediction framework
-    Support multiple backbone GNN. Mainly used for traffic prediction.
-
-    Parameter
-    ==========
-    in_feats : int
-        number of input features
-
-    out_feats : int
-        number of prediction output features
-
-    seq_len : int
-        input and predicted sequence length
-
-    num_layers : int
-        vertical number of layers in encoder and decoder unit
-
-    net : torch.nn.Module
-        Message passing GNN as backbone
-
-    decay_steps : int
-        number of steps for the teacher forcing probability to decay
+    Boltzmann-based cell replacing traditional GraphGRUCell.
     """
+    def __init__(self, velocity_set, collision_hidden_dim=64):
+        super(BoltzmannCell, self).__init__()
+        self.velocity_set = velocity_set
+        self.Q = velocity_set.Q
+        
+        # Boltzmann components
+        self.collision_op = CollisionOperator(velocity_set, collision_hidden_dim)
+        self.flow_calculator = FlowWeightCalculator(self.Q)  # feature_dim = Q
+        self.boltzmann_updater = BoltzmannUpdater(velocity_set, self.collision_op, self.flow_calculator)
+                
+    def forward(self, graph, inputs, dt=0.1):
+        """
+        Single time step update using Boltzmann equation.
+        
+        Args:
+            graph: DGL graph with edge weights (distances)
+            inputs: Mesoscale distribution [batch_size, N, Q]
+            dt: Time step
+        Returns:
+            Updated distribution [batch_size, N, Q]
+        """
+        batch_size, num_nodes, _ = inputs.shape
+        
+        if batch_size > 1:
+            # Process each batch element separately for now
+            # TODO: Optimize for batched processing
+            outputs = []
+            for b in range(batch_size):
+                # Extract single batch
+                f_single = inputs[b]  # [N, Q]
+                
+                # Use mesoscale distribution directly as node features
+                node_features = f_single  # [N, Q] - no encoding needed
+                
+                # Apply Boltzmann update
+                f_updated = self.boltzmann_updater(graph, f_single, node_features, dt)
+                outputs.append(f_updated)
+            
+            return torch.stack(outputs, dim=0)  # [batch_size, N, Q]
+        else:
+            # Single batch element
+            f_single = inputs.squeeze(0)  # [N, Q]
+            node_features = f_single  # [N, Q] - use distribution directly
+            f_updated = self.boltzmann_updater(graph, f_single, node_features, dt)
+            return f_updated.unsqueeze(0)  # [1, N, Q]
 
-    def __init__(
-        self, in_feats, out_feats, seq_len, num_layers, net, decay_steps
-    ):
-        super(GraphRNN, self).__init__()
-        self.in_feats = in_feats
-        self.out_feats = out_feats
-        self.seq_len = seq_len
-        self.num_layers = num_layers
-        self.net = net
-        self.decay_steps = decay_steps
 
+class BoltzmannTrafficFlow(nn.Module):
+    """
+    Main model class for traffic flow prediction using Boltzmann equation.
+    Modified from TrafficFlowRNN to use Boltzmann-based temporal updates.
+    """
+    def __init__(self, adj_mat, input_dim, velocity_set, hidden_dim=64, 
+                 encoder_layers=2, dt=0.1, device='cpu'):
+        super(BoltzmannTrafficFlow, self).__init__()
+        
+        self.adj_mat = adj_mat
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.velocity_set = velocity_set
+        self.Q = velocity_set.Q
+        self.dt = dt
+        self.device = device
+        
+        # Build graph from adjacency matrix
+        self.graph = self._build_graph(adj_mat)
+        
+        # Model components
         self.encoder = StackedEncoder(
-            self.in_feats, self.out_feats, self.num_layers, self.net
+            input_dim=input_dim,
+            velocity_set=velocity_set,
+            hidden_dim=hidden_dim,
+            num_layers=encoder_layers
         )
-
-        self.decoder = StackedDecoder(
-            self.in_feats,
-            self.out_feats,
-            self.in_feats,
-            self.num_layers,
-            self.net,
+        
+        self.boltzmann_cell = BoltzmannCell(
+            velocity_set=velocity_set,
+            collision_hidden_dim=hidden_dim,
+            flow_feature_dim=hidden_dim
         )
-
-    # Threshold For Teacher Forcing
-
-    def compute_thresh(self, batch_cnt):
-        return self.decay_steps / (
-            self.decay_steps + np.exp(batch_cnt / self.decay_steps)
-        )
-
-    def encode(self, g, inputs, device):
-        hidden_states = [
-            torch.zeros(g.num_nodes(), self.out_feats).to(device)
-            for _ in range(self.num_layers)
-        ]
-        for i in range(self.seq_len):
-            _, hidden_states = self.encoder(g, inputs[i], hidden_states)
-
-        return hidden_states
-
-    def decode(self, g, teacher_states, hidden_states, batch_cnt, device):
-        outputs = []
-        inputs = torch.zeros(g.num_nodes(), self.in_feats).to(device)
-        for i in range(self.seq_len):
-            if (
-                np.random.random() < self.compute_thresh(batch_cnt)
-                and self.training
-            ):
-                inputs, hidden_states = self.decoder(
-                    g, teacher_states[i], hidden_states
-                )
+        
+        self.decoder = MomentDecoder(velocity_set)
+        
+    def _build_graph(self, adj_mat):
+        """Build DGL graph from adjacency matrix."""
+        # Find edges from adjacency matrix
+        edges = torch.nonzero(adj_mat, as_tuple=True)
+        src, dst = edges
+        
+        # Create DGL graph
+        graph = dgl.graph((src, dst), device=self.device)
+        
+        # Set edge weights (distances)
+        # Use adjacency matrix values as distances
+        edge_weights = adj_mat[src, dst]
+        graph.edata['weight'] = edge_weights.float()
+        
+        return graph
+        
+    def forward(self, inputs, targets=None):
+        """
+        Forward pass for multi-step prediction.
+        
+        Args:
+            inputs: Historical data [batch_size, input_len, num_nodes, input_dim]
+            targets: Target data [batch_size, output_len, num_nodes, input_dim] (optional)
+            
+        Returns:
+            predictions: [batch_size, output_len, num_nodes, input_dim]
+            auxiliary_loss: Variance loss from decoder
+        """
+        batch_size, input_len, num_nodes, input_dim = inputs.shape
+        
+        # Use last time step as initial condition
+        current_state = inputs[:, -1, :, :]  # [batch_size, num_nodes, input_dim]
+        
+        # Encode to mesoscale
+        current_meso = self.encoder(self.graph, current_state)  # [batch_size, num_nodes, Q]
+        
+        predictions = []
+        total_variance_loss = 0.0
+        
+        # Predict multiple steps (typically 12 steps)
+        output_len = targets.shape[1] if targets is not None else 12
+        
+        for t in range(output_len):
+            # Boltzmann temporal update
+            next_meso = self.boltzmann_cell(self.graph, current_meso, self.dt)
+            
+            # Decode to macroscale
+            density, velocity, variance_loss = self.decoder(next_meso)
+            
+            # Combine density and velocity into prediction
+            # Assuming input_dim = 2 (density + velocity)
+            if input_dim == 2:
+                prediction = torch.stack([density, velocity], dim=-1)  # [batch_size, num_nodes, 2]
             else:
-                inputs, hidden_states = self.decoder(g, inputs, hidden_states)
-            outputs.append(inputs)
-        outputs = torch.stack(outputs)
-        return outputs
+                # If more features, just use density for now
+                prediction = density.unsqueeze(-1)  # [batch_size, num_nodes, 1]
+                if input_dim > 1:
+                    # Pad with zeros or extend as needed
+                    padding = torch.zeros(batch_size, num_nodes, input_dim - 1, device=density.device)
+                    prediction = torch.cat([prediction, padding], dim=-1)
+            
+            predictions.append(prediction)
+            total_variance_loss += variance_loss
+            
+            # Update current state for next iteration
+            current_meso = next_meso
+        
+        predictions = torch.stack(predictions, dim=1)  # [batch_size, output_len, num_nodes, input_dim]
+        avg_variance_loss = total_variance_loss / output_len
+        
+        return predictions, avg_variance_loss
+    
+    def get_param_groups(self):
+        """
+        Get parameter groups for different learning rates.
+        """
+        # Encoder parameters (graph convolution)
+        encoder_params = list(self.encoder.parameters())
+        
+        # Boltzmann parameters (collision operator, flow calculator)
+        boltzmann_params = list(self.boltzmann_cell.parameters())
+        
+        # Decoder parameters (minimal, mostly explicit calculations)
+        decoder_params = list(self.decoder.parameters())
+        
+        return [
+            {"params": encoder_params, "lr": 1e-3, "name": "encoder"},
+            {"params": boltzmann_params, "lr": 1e-3, "name": "boltzmann"},
+            {"params": decoder_params, "lr": 1e-4, "name": "decoder"}
+        ]
 
-    def forward(self, g, inputs, teacher_states, batch_cnt, device):
-        hidden = self.encode(g, inputs, device)
-        outputs = self.decode(g, teacher_states, hidden, batch_cnt, device)
-        return outputs
+
+# Factory function to create model with predefined settings
+def create_boltzmann_traffic_model(adj_mat, input_dim=2, num_velocities=20, max_velocity=2.0,
+                                  hidden_dim=64, device='cpu'):
+    """
+    Factory function to create Boltzmann traffic flow model.
+    
+    Args:
+        adj_mat: Adjacency matrix [N, N]
+        input_dim: Number of input features (e.g., 2 for density + velocity)
+        num_velocities: Number of velocity components (Q)
+        max_velocity: Maximum velocity for traffic flow
+        hidden_dim: Hidden dimension for neural networks
+        device: Computing device
+        
+    Returns:
+        BoltzmannTrafficFlow model
+    """
+    # Create velocity set
+    velocity_set = VelocitySet(
+        num_velocities=num_velocities,
+        max_velocity=max_velocity,
+        device=device
+    )
+    
+    # Create model
+    model = BoltzmannTrafficFlow(
+        adj_mat=adj_mat,
+        input_dim=input_dim,
+        velocity_set=velocity_set,
+        hidden_dim=hidden_dim,
+        device=device
+    )
+    
+    return model.to(device)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Test the model
+    device = 'cpu'
+    num_nodes = 10
+    
+    # Create random adjacency matrix
+    adj_mat = torch.rand(num_nodes, num_nodes)
+    adj_mat = (adj_mat > 0.7).float()  # Sparse connectivity
+    adj_mat.fill_diagonal_(0)  # No self loops
+    
+    # Create model
+    model = create_boltzmann_traffic_model(
+        adj_mat=adj_mat,
+        input_dim=2,
+        num_velocities=20,
+        device=device
+    )
+    
+    # Test data
+    batch_size = 4
+    input_len = 12
+    output_len = 12
+    
+    inputs = torch.rand(batch_size, input_len, num_nodes, 2)
+    targets = torch.rand(batch_size, output_len, num_nodes, 2)
+    
+    # Forward pass
+    predictions, variance_loss = model(inputs, targets)
+    
+    print(f"Input shape: {inputs.shape}")
+    print(f"Prediction shape: {predictions.shape}")
+    print(f"Variance loss: {variance_loss.item()}")
+    print("Model test passed!")
+    
+    # Check parameter groups
+    param_groups = model.get_param_groups()
+    for group in param_groups:
+        print(f"{group['name']}: {len(group['params'])} parameter groups")
