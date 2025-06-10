@@ -1,371 +1,474 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import dgl
 import dgl.function as fn
-from dgl.nn.pytorch import GraphConv
-from boltzmann import VelocitySet, CollisionOperator, FlowWeightCalculator, BoltzmannUpdater, MomentDecoder
+import numpy as np
+from typing import Optional, Union
+from dcrnn import DiffConv
+from gaan import GatedGAT
+from functools import partial
 
 
-class DiffusionGraphConv(nn.Module):
+class MacroToMesoEncoder(nn.Module):
     """
-    Diffusion graph convolution layer.
+    Encoder that lifts macroscale variables to mesoscale.
+    Maps R^{N×d} → R^{N×Q}
+    Incorporates spatial information using graph convolution.
     """
-    def __init__(self, in_feats, out_feats, num_hops):
-        super(DiffusionGraphConv, self).__init__()
-        self.num_hops = num_hops
-        self.in_feats = in_feats
-        self.out_feats = out_feats
+    def __init__(self, d_features: int, Q_mesoscale: int, spatial_conv_type: str = 'diffconv', 
+                 conv_params: dict = None):
+        super(MacroToMesoEncoder, self).__init__()
+        self.d_features = d_features
+        self.Q_mesoscale = Q_mesoscale
+        self.spatial_conv_type = spatial_conv_type
         
-        # Learnable weights for each hop
-        self.linear = nn.Linear(in_feats * (num_hops + 1), out_feats)
-        
-    def forward(self, graph, feat):
+        # Choose spatial convolution method
+        if spatial_conv_type == 'diffconv':
+            # Parameters for DiffConv
+            k = conv_params.get('k', 2) if conv_params else 2
+            in_graph_list = conv_params.get('in_graph_list', [])
+            out_graph_list = conv_params.get('out_graph_list', [])
+            self.spatial_conv = DiffConv(d_features, Q_mesoscale, k, 
+                                       in_graph_list, out_graph_list)
+        elif spatial_conv_type == 'gaan':
+            # Parameters for GatedGAT
+            map_feats = conv_params.get('map_feats', 64) if conv_params else 64
+            num_heads = conv_params.get('num_heads', 2) if conv_params else 2
+            self.spatial_conv = GatedGAT(d_features, Q_mesoscale, map_feats, num_heads)
+        else:
+            raise ValueError(f"Unsupported spatial_conv_type: {spatial_conv_type}")
+    
+    def forward(self, graph, macro_features):
         """
         Args:
             graph: DGL graph
-            feat: Input features [N, in_feats]
+            macro_features: [N, d] macroscale features
         Returns:
-            Output features [N, out_feats]
+            meso_features: [N, Q] mesoscale distribution
         """
-        graph = graph.local_var()
-        
-        # Normalize adjacency matrix
-        degs = graph.in_degrees().float().clamp(min=1)
-        norm = torch.pow(degs, -0.5)
-        graph.ndata['norm'] = norm.unsqueeze(1)
-        
-        feat_list = [feat]  # 0-hop (self)
-        
-        # Multi-hop diffusion
-        graph.ndata['h'] = feat
-        for _ in range(self.num_hops):
-            graph.update_all(fn.u_mul_e('h', 'norm', 'm'), fn.sum('m', 'h_new'))
-            graph.ndata['h'] = graph.ndata['h_new'] * graph.ndata['norm']
-            feat_list.append(graph.ndata['h'])
-        
-        # Concatenate all hops
-        feat_concat = torch.cat(feat_list, dim=-1)  # [N, in_feats * (num_hops + 1)]
-        
-        return self.linear(feat_concat)
+        meso_features = self.spatial_conv(graph, macro_features)
+        return meso_features
 
 
-class StackedEncoder(nn.Module):
+class CollisionOperator(nn.Module):
     """
-    Modified encoder that lifts macroscale variables to mesoscale (Q dimensions).
+    Collision operator Ω(f) with collision invariance constraints.
+    Currently implemented as local (no inter-node correlations).
     """
-    def __init__(self, input_dim, velocity_set, hidden_dim=64, num_layers=2, num_hops=2):
-        super(StackedEncoder, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.Q = velocity_set.Q  # Number of velocity components
+    def __init__(self, Q_mesoscale: int, hidden_dim: int = 64, 
+                 constraint_type: str = 'none', xi_velocities: torch.Tensor = None):
+        super(CollisionOperator, self).__init__()
+        self.Q_mesoscale = Q_mesoscale
+        self.constraint_type = constraint_type  # 'none', 'soft', 'hard'
         
-        # Graph convolution layers
-        self.layers = nn.ModuleList()
+        # Simple MLP for collision operator
+        self.mlp = nn.Sequential(
+            nn.Linear(Q_mesoscale, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, Q_mesoscale)
+        )
         
-        # First layer: input_dim -> hidden_dim
-        self.layers.append(DiffusionGraphConv(input_dim, hidden_dim, num_hops))
-        
-        # Hidden layers: hidden_dim -> hidden_dim
-        for _ in range(num_layers - 2):
-            self.layers.append(DiffusionGraphConv(hidden_dim, hidden_dim, num_hops))
-        
-        # Last layer: hidden_dim -> Q (mesoscale)
-        if num_layers > 1:
-            self.layers.append(DiffusionGraphConv(hidden_dim, self.Q, num_hops))
+        # Store velocity discretization points ξ_k
+        if xi_velocities is not None:
+            self.register_buffer('xi_velocities', xi_velocities)  # [Q]
+            # Compute collision invariance matrix C
+            self.register_buffer('C_matrix', self._compute_C_matrix())
         else:
-            # If only one layer, direct mapping
-            self.layers[0] = DiffusionGraphConv(input_dim, self.Q, num_hops)
+            self.xi_velocities = None
+            self.C_matrix = None
+    
+    def _compute_C_matrix(self):
+        """
+        Compute collision invariance matrix C for constraints:
+        - Mass conservation: ∫ Ω(f) dξ = 0
+        - Momentum conservation: ∫ ξ Ω(f) dξ = 0  
+        - Energy conservation: ∫ ξ² Ω(f) dξ = 0
+        """
+        Q = self.Q_mesoscale
+        # Assume equal weights w_i = 1/Q for now
+        w = torch.ones(Q) / Q
         
-        self.dropout = nn.Dropout(0.1)
+        C = torch.zeros(3, Q)
+        C[0, :] = w  # Mass conservation
+        C[1, :] = w * self.xi_velocities  # Momentum conservation
+        C[2, :] = 0.5 * w * self.xi_velocities**2  # Energy conservation
         
-    def forward(self, graph, inputs):
+        return C
+    
+    def _apply_hard_constraint(self, omega_raw):
+        """
+        Apply hard collision invariance constraint using Lagrangian method.
+        Ω* = (I - C^T(CC^T)^{-1}C) Ω
+        """
+        if self.C_matrix is None:
+            return omega_raw
+        
+        C = self.C_matrix  # [3, Q]
+        I = torch.eye(self.Q_mesoscale, device=omega_raw.device)
+        
+        # Compute projection matrix
+        CCT_inv = torch.inverse(C @ C.T + 1e-6 * torch.eye(3, device=omega_raw.device))
+        projection = I - C.T @ CCT_inv @ C
+        
+        # Apply projection to each node
+        omega_constrained = omega_raw @ projection.T
+        
+        return omega_constrained
+    
+    def compute_soft_constraint_loss(self, omega):
+        """
+        Compute soft constraint loss for collision invariance.
+        """
+        if self.C_matrix is None:
+            return torch.tensor(0.0, device=omega.device)
+        
+        # omega: [N, Q]
+        # C: [3, Q]
+        constraint_violations = torch.matmul(omega, self.C_matrix.T)  # [N, 3]
+        loss = torch.mean(constraint_violations**2)
+        
+        return loss
+    
+    def forward(self, f_distribution):
+        """
+        Args:
+            f_distribution: [N, Q] mesoscale distribution
+        Returns:
+            omega: [N, Q] collision operator output
+            constraint_loss: scalar (only for soft constraint)
+        """
+        omega_raw = self.mlp(f_distribution)
+        
+        if self.constraint_type == 'hard':
+            omega = self._apply_hard_constraint(omega_raw)
+            constraint_loss = torch.tensor(0.0, device=f_distribution.device)
+        elif self.constraint_type == 'soft':
+            omega = omega_raw
+            constraint_loss = self.compute_soft_constraint_loss(omega)
+        else:  # 'none'
+            omega = omega_raw
+            constraint_loss = torch.tensor(0.0, device=f_distribution.device)
+        
+        return omega, constraint_loss
+
+
+class SGraphRNN(nn.Module):
+    """
+    Purely data-driven module for modeling source term S(f).
+    Similar to GraphRNN but operates entirely in Q-dimensional space.
+    """
+    def __init__(self, d_features: int, Q_mesoscale: int, hidden_dim: int = 64,
+                 spatial_conv_type: str = 'diffconv', conv_params: dict = None):
+        super(SGraphRNN, self).__init__()
+        self.d_features = d_features
+        self.Q_mesoscale = Q_mesoscale
+        self.hidden_dim = hidden_dim
+        
+        # Encoder: d → Q (with spatial information)
+        self.encoder = MacroToMesoEncoder(d_features, Q_mesoscale, 
+                                        spatial_conv_type, conv_params)
+        
+        # GRU for temporal evolution in Q-dimensional space
+        self.gru_cell = nn.GRUCell(Q_mesoscale, hidden_dim)
+        
+        # Output projection: hidden → Q (source term)
+        self.output_proj = nn.Linear(hidden_dim, Q_mesoscale)
+        
+        # Initialize hidden state
+        self.hidden_dim = hidden_dim
+    
+    def init_hidden(self, batch_size, num_nodes, device):
+        """Initialize hidden state for GRU."""
+        return torch.zeros(batch_size * num_nodes, self.hidden_dim, device=device)
+    
+    def forward(self, graph, macro_features, hidden_state=None):
         """
         Args:
             graph: DGL graph
-            inputs: Input features [batch_size, N, input_dim]
+            macro_features: [N, d] macroscale features
+            hidden_state: [N, hidden_dim] or None
         Returns:
-            Mesoscale distribution [batch_size, N, Q]
+            source_term: [N, Q] source term in mesoscale
+            new_hidden: [N, hidden_dim] updated hidden state
         """
-        batch_size, num_nodes, _ = inputs.shape
+        N = macro_features.shape[0]
+        device = macro_features.device
         
-        # Reshape for processing: [batch_size * N, input_dim]
-        x = inputs.view(-1, self.input_dim)
+        if hidden_state is None:
+            hidden_state = torch.zeros(N, self.hidden_dim, device=device)
         
-        # Create batched graph
-        if batch_size > 1:
-            batched_graph = dgl.batch([graph] * batch_size)
-        else:
-            batched_graph = graph
+        # Encode macro features to mesoscale
+        meso_input = self.encoder(graph, macro_features)  # [N, Q]
         
-        # Apply graph convolution layers
-        for i, layer in enumerate(self.layers):
-            x = layer(batched_graph, x)
-            if i < len(self.layers) - 1:  # No activation on last layer
-                x = F.relu(x)
-                x = self.dropout(x)
+        # GRU update
+        hidden_flat = hidden_state.view(-1, self.hidden_dim)
+        meso_flat = meso_input.view(-1, self.Q_mesoscale)
         
-        # Ensure non-negativity (physical constraint for distribution)
-        x = F.softplus(x)
+        new_hidden_flat = self.gru_cell(meso_flat, hidden_flat)
+        new_hidden = new_hidden_flat.view(N, self.hidden_dim)
         
-        # Reshape back: [batch_size, N, Q]
-        x = x.view(batch_size, num_nodes, self.Q)
+        # Generate source term
+        source_term = self.output_proj(new_hidden)  # [N, Q]
         
-        return x
+        return source_term, new_hidden
 
 
-class BoltzmannCell(nn.Module):
+class BoltzmannUpdater(nn.Module):
     """
-    Boltzmann-based cell replacing traditional GraphGRUCell.
+    Physical update module based on discretized Boltzmann equation.
+    Implements: f(t+Δt) = f(t) - Δt[Transport - Collision + Source]
     """
-    def __init__(self, velocity_set, collision_hidden_dim=64):
-        super(BoltzmannCell, self).__init__()
-        self.velocity_set = velocity_set
-        self.Q = velocity_set.Q
-        
-        # Boltzmann components
-        self.collision_op = CollisionOperator(velocity_set, collision_hidden_dim)
-        self.flow_calculator = FlowWeightCalculator(self.Q)  # feature_dim = Q
-        self.boltzmann_updater = BoltzmannUpdater(velocity_set, self.collision_op, self.flow_calculator)
-                
-    def forward(self, graph, inputs, dt=0.1):
-        """
-        Single time step update using Boltzmann equation.
-        
-        Args:
-            graph: DGL graph with edge weights (distances)
-            inputs: Mesoscale distribution [batch_size, N, Q]
-            dt: Time step
-        Returns:
-            Updated distribution [batch_size, N, Q]
-        """
-        batch_size, num_nodes, _ = inputs.shape
-        
-        if batch_size > 1:
-            # Process each batch element separately for now
-            # TODO: Optimize for batched processing
-            outputs = []
-            for b in range(batch_size):
-                # Extract single batch
-                f_single = inputs[b]  # [N, Q]
-                
-                # Use mesoscale distribution directly as node features
-                node_features = f_single  # [N, Q] - no encoding needed
-                
-                # Apply Boltzmann update
-                f_updated = self.boltzmann_updater(graph, f_single, node_features, dt)
-                outputs.append(f_updated)
-            
-            return torch.stack(outputs, dim=0)  # [batch_size, N, Q]
-        else:
-            # Single batch element
-            f_single = inputs.squeeze(0)  # [N, Q]
-            node_features = f_single  # [N, Q] - use distribution directly
-            f_updated = self.boltzmann_updater(graph, f_single, node_features, dt)
-            return f_updated.unsqueeze(0)  # [1, N, Q]
-
-
-class BoltzmannTrafficFlow(nn.Module):
-    """
-    Main model class for traffic flow prediction using Boltzmann equation.
-    Modified from TrafficFlowRNN to use Boltzmann-based temporal updates.
-    """
-    def __init__(self, adj_mat, input_dim, velocity_set, hidden_dim=64, 
-                 encoder_layers=2, dt=0.1, device='cpu'):
-        super(BoltzmannTrafficFlow, self).__init__()
-        
-        self.adj_mat = adj_mat
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.velocity_set = velocity_set
-        self.Q = velocity_set.Q
+    def __init__(self, Q_mesoscale: int, xi_velocities: torch.Tensor, dt: float = 0.1):
+        super(BoltzmannUpdater, self).__init__()
+        self.Q_mesoscale = Q_mesoscale
         self.dt = dt
-        self.device = device
         
-        # Build graph from adjacency matrix
-        self.graph = self._build_graph(adj_mat)
+        # Register velocity discretization
+        self.register_buffer('xi_velocities', xi_velocities)  # [Q]
         
-        # Model components
-        self.encoder = StackedEncoder(
-            input_dim=input_dim,
-            velocity_set=velocity_set,
-            hidden_dim=hidden_dim,
-            num_layers=encoder_layers
-        )
-        
-        self.boltzmann_cell = BoltzmannCell(
-            velocity_set=velocity_set,
-            collision_hidden_dim=hidden_dim,
-            flow_feature_dim=hidden_dim
-        )
-        
-        self.decoder = MomentDecoder(velocity_set)
-        
-    def _build_graph(self, adj_mat):
-        """Build DGL graph from adjacency matrix."""
-        # Find edges from adjacency matrix
-        edges = torch.nonzero(adj_mat, as_tuple=True)
-        src, dst = edges
-        
-        # Create DGL graph
-        graph = dgl.graph((src, dst), device=self.device)
-        
-        # Set edge weights (distances)
-        # Use adjacency matrix values as distances
-        edge_weights = adj_mat[src, dst]
-        graph.edata['weight'] = edge_weights.float()
-        
-        return graph
-        
-    def forward(self, inputs, targets=None):
+        # Learnable flow weights q_ij (initialized uniformly)
+        # Note: These will be computed based on graph structure
+    
+    def compute_transport_term(self, graph, f_distribution):
         """
-        Forward pass for multi-step prediction.
+        Compute transport term: Σ_j q_ij ξ_k (f_j - f_i) / d_ij
+        """
+        with graph.local_scope():
+            # Store distribution on nodes
+            graph.ndata['f'] = f_distribution  # [N, Q]
+            
+            # Compute differences for each velocity component
+            transport_terms = []
+            
+            for k in range(self.Q_mesoscale):
+                xi_k = self.xi_velocities[k]
+                
+                # Message function: compute ξ_k * (f_j - f_i) / d_ij for each edge
+                def message_func(edges):
+                    f_diff = edges.src['f'][:, k] - edges.dst['f'][:, k]  # [E]
+                    # Use edge weight as 1/d_ij, and assume q_ij is uniform for now
+                    edge_weight = edges.data.get('weight', torch.ones_like(f_diff))
+                    q_ij = 1.0 / edges.dst['degree']  # Approximate uniform distribution
+                    
+                    transport = q_ij * xi_k * f_diff * edge_weight
+                    return {'transport_k': transport}
+                
+                # Reduce function: sum over neighbors
+                def reduce_func(nodes):
+                    return {'transport_sum_k': torch.sum(nodes.mailbox['transport_k'], dim=1)}
+                
+                # Add degree information
+                graph.ndata['degree'] = graph.in_degrees().float().clamp(min=1.0)
+                
+                # Apply message passing for this velocity component
+                graph.update_all(message_func, reduce_func)
+                transport_terms.append(graph.ndata['transport_sum_k'])
+            
+            # Stack transport terms: [N, Q]
+            transport_term = torch.stack(transport_terms, dim=1)
+            
+        return transport_term
+    
+    def forward(self, graph, f_distribution, collision_term, source_term):
+        """
+        Update distribution using Boltzmann equation.
         
         Args:
-            inputs: Historical data [batch_size, input_len, num_nodes, input_dim]
-            targets: Target data [batch_size, output_len, num_nodes, input_dim] (optional)
-            
+            graph: DGL graph with edge weights
+            f_distribution: [N, Q] current distribution
+            collision_term: [N, Q] collision operator output
+            source_term: [N, Q] source term
         Returns:
-            predictions: [batch_size, output_len, num_nodes, input_dim]
-            auxiliary_loss: Variance loss from decoder
+            f_new: [N, Q] updated distribution
         """
-        batch_size, input_len, num_nodes, input_dim = inputs.shape
+        # Compute transport term
+        transport_term = self.compute_transport_term(graph, f_distribution)
         
-        # Use last time step as initial condition
-        current_state = inputs[:, -1, :, :]  # [batch_size, num_nodes, input_dim]
+        # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision + Source]
+        f_new = f_distribution - self.dt * (transport_term - collision_term + source_term)
         
-        # Encode to mesoscale
-        current_meso = self.encoder(self.graph, current_state)  # [batch_size, num_nodes, Q]
+        return f_new
+
+
+class MesoToMacroDecoder(nn.Module):
+    """
+    Explicit decoder that converts mesoscale distribution to macroscale variables.
+    Implements moment calculation: ρ = ∫f dξ, u = ∫ξf dξ/ρ, etc.
+    """
+    def __init__(self, Q_mesoscale: int, d_features: int, xi_velocities: torch.Tensor):
+        super(MesoToMacroDecoder, self).__init__()
+        self.Q_mesoscale = Q_mesoscale
+        self.d_features = d_features
+        
+        # Register velocity discretization and weights
+        self.register_buffer('xi_velocities', xi_velocities)  # [Q]
+        # For now, use equal weights (UQ methods can be added later)
+        self.register_buffer('weights', torch.ones(Q_mesoscale) / Q_mesoscale)  # [Q]
+    
+    def forward(self, f_distribution):
+        """
+        Compute macroscale moments from mesoscale distribution.
+        
+        Args:
+            f_distribution: [N, Q] mesoscale distribution
+        Returns:
+            macro_variables: [N, d] macroscale variables
+        """
+        N = f_distribution.shape[0]
+        macro_variables = []
+        
+        # 0th moment: density ρ = ∫f dξ
+        density = torch.sum(f_distribution * self.weights, dim=1, keepdim=True)  # [N, 1]
+        macro_variables.append(density)
+        
+        # 1st moment: velocity u = ∫ξf dξ / ρ  
+        momentum = torch.sum(f_distribution * self.weights * self.xi_velocities, dim=1, keepdim=True)  # [N, 1]
+        velocity = momentum / (density + 1e-8)  # Avoid division by zero
+        macro_variables.append(velocity)
+        
+        # Higher moments can be added based on d_features
+        if self.d_features > 2:
+            # 2nd moment: energy/temperature related
+            energy = torch.sum(f_distribution * self.weights * self.xi_velocities**2, dim=1, keepdim=True)
+            macro_variables.append(energy)
+        
+        # Add more moments as needed to match d_features
+        while len(macro_variables) < self.d_features:
+            # Add higher order moments or other derived quantities
+            moment_order = len(macro_variables)
+            higher_moment = torch.sum(f_distribution * self.weights * (self.xi_velocities**moment_order), 
+                                    dim=1, keepdim=True)
+            macro_variables.append(higher_moment)
+        
+        # Concatenate and select first d_features
+        macro_output = torch.cat(macro_variables[:self.d_features], dim=1)  # [N, d]
+        
+        return macro_output
+
+
+class KineticForecastingFramework(nn.Module):
+    """
+    Complete kinetic theory-informed forecasting framework.
+    Integrates all five modules: Encoder → Updater ← (Collision + Source) → Decoder
+    """
+    def __init__(self, d_features: int, Q_mesoscale: int, xi_velocities: torch.Tensor,
+                 spatial_conv_type: str = 'diffconv', conv_params: dict = None,
+                 collision_constraint: str = 'none', dt: float = 0.1):
+        super(KineticForecastingFramework, self).__init__()
+        
+        self.d_features = d_features
+        self.Q_mesoscale = Q_mesoscale
+        
+        # Module 1: MacroToMesoEncoder
+        self.macro_to_meso = MacroToMesoEncoder(d_features, Q_mesoscale, 
+                                              spatial_conv_type, conv_params)
+        
+        # Module 2: BoltzmannUpdater  
+        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, xi_velocities, dt)
+        
+        # Module 3: SGraphRNN (for source term)
+        self.source_rnn = SGraphRNN(d_features, Q_mesoscale, 
+                                   spatial_conv_type=spatial_conv_type, 
+                                   conv_params=conv_params)
+        
+        # Module 4: CollisionOperator
+        self.collision_op = CollisionOperator(Q_mesoscale, constraint_type=collision_constraint,
+                                            xi_velocities=xi_velocities)
+        
+        # Module 5: MesoToMacroDecoder
+        self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, d_features, xi_velocities)
+        
+        # Store for source term hidden states
+        self.source_hidden = None
+    
+    def forward(self, graph, macro_features_sequence, num_pred_steps: int = 1):
+        """
+        Forward pass for sequence prediction.
+        
+        Args:
+            graph: DGL graph
+            macro_features_sequence: [T, N, d] input sequence  
+            num_pred_steps: number of future steps to predict
+        Returns:
+            predictions: [num_pred_steps, N, d] predicted macroscale variables
+            constraint_losses: collision invariance losses
+        """
+        device = macro_features_sequence.device
+        T, N, d = macro_features_sequence.shape
         
         predictions = []
-        total_variance_loss = 0.0
+        constraint_losses = []
         
-        # Predict multiple steps (typically 12 steps)
-        output_len = targets.shape[1] if targets is not None else 12
+        # Initialize source term hidden state
+        if self.source_hidden is None:
+            self.source_hidden = self.source_rnn.init_hidden(1, N, device)
         
-        for t in range(output_len):
-            # Boltzmann temporal update
-            next_meso = self.boltzmann_cell(self.graph, current_meso, self.dt)
-            
-            # Decode to macroscale
-            density, velocity, variance_loss = self.decoder(next_meso)
-            
-            # Combine density and velocity into prediction
-            # Assuming input_dim = 2 (density + velocity)
-            if input_dim == 2:
-                prediction = torch.stack([density, velocity], dim=-1)  # [batch_size, num_nodes, 2]
-            else:
-                # If more features, just use density for now
-                prediction = density.unsqueeze(-1)  # [batch_size, num_nodes, 1]
-                if input_dim > 1:
-                    # Pad with zeros or extend as needed
-                    padding = torch.zeros(batch_size, num_nodes, input_dim - 1, device=density.device)
-                    prediction = torch.cat([prediction, padding], dim=-1)
-            
-            predictions.append(prediction)
-            total_variance_loss += variance_loss
-            
-            # Update current state for next iteration
-            current_meso = next_meso
+        # Use last time step as initial condition
+        current_macro = macro_features_sequence[-1]  # [N, d]
         
-        predictions = torch.stack(predictions, dim=1)  # [batch_size, output_len, num_nodes, input_dim]
-        avg_variance_loss = total_variance_loss / output_len
+        for step in range(num_pred_steps):
+            # 1. Encode: macro → meso
+            f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
+            
+            # 2. Compute source term
+            source_term, self.source_hidden = self.source_rnn(graph, current_macro, 
+                                                             self.source_hidden)
+            
+            # 3. Compute collision term
+            collision_term, constraint_loss = self.collision_op(f_current)
+            constraint_losses.append(constraint_loss)
+            
+            # 4. Update using Boltzmann equation
+            f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
+            
+            # 5. Decode: meso → macro
+            macro_next = self.meso_to_macro(f_next)  # [N, d]
+            
+            predictions.append(macro_next)
+            current_macro = macro_next  # Update for next iteration
         
-        return predictions, avg_variance_loss
+        predictions = torch.stack(predictions, dim=0)  # [num_pred_steps, N, d]
+        total_constraint_loss = torch.stack(constraint_losses).mean()
+        
+        return predictions, total_constraint_loss
     
-    def get_param_groups(self):
-        """
-        Get parameter groups for different learning rates.
-        """
-        # Encoder parameters (graph convolution)
-        encoder_params = list(self.encoder.parameters())
-        
-        # Boltzmann parameters (collision operator, flow calculator)
-        boltzmann_params = list(self.boltzmann_cell.parameters())
-        
-        # Decoder parameters (minimal, mostly explicit calculations)
-        decoder_params = list(self.decoder.parameters())
-        
-        return [
-            {"params": encoder_params, "lr": 1e-3, "name": "encoder"},
-            {"params": boltzmann_params, "lr": 1e-3, "name": "boltzmann"},
-            {"params": decoder_params, "lr": 1e-4, "name": "decoder"}
-        ]
+    def reset_source_hidden(self):
+        """Reset source term hidden state."""
+        self.source_hidden = None
 
 
-# Factory function to create model with predefined settings
-def create_boltzmann_traffic_model(adj_mat, input_dim=2, num_velocities=20, max_velocity=2.0,
-                                  hidden_dim=64, device='cpu'):
+# Example usage and initialization
+def create_kinetic_framework(d_features: int = 2, Q_mesoscale: int = 16, 
+                           xi_range: tuple = (-3, 3), **kwargs):
     """
-    Factory function to create Boltzmann traffic flow model.
-    
-    Args:
-        adj_mat: Adjacency matrix [N, N]
-        input_dim: Number of input features (e.g., 2 for density + velocity)
-        num_velocities: Number of velocity components (Q)
-        max_velocity: Maximum velocity for traffic flow
-        hidden_dim: Hidden dimension for neural networks
-        device: Computing device
-        
-    Returns:
-        BoltzmannTrafficFlow model
+    Helper function to create the kinetic framework with default parameters.
     """
-    # Create velocity set
-    velocity_set = VelocitySet(
-        num_velocities=num_velocities,
-        max_velocity=max_velocity,
-        device=device
+    # Create velocity discretization
+    xi_velocities = torch.linspace(xi_range[0], xi_range[1], Q_mesoscale)
+    
+    # Default conv_params for different spatial convolution types
+    if kwargs.get('spatial_conv_type') == 'gaan':
+        conv_params = {
+            'map_feats': kwargs.get('map_feats', 64),
+            'num_heads': kwargs.get('num_heads', 2)
+        }
+    else:  # diffconv
+        conv_params = {
+            'k': kwargs.get('k', 2),
+            'in_graph_list': kwargs.get('in_graph_list', []),
+            'out_graph_list': kwargs.get('out_graph_list', [])
+        }
+    
+    framework = KineticForecastingFramework(
+        d_features=d_features,
+        Q_mesoscale=Q_mesoscale, 
+        xi_velocities=xi_velocities,
+        spatial_conv_type=kwargs.get('spatial_conv_type', 'diffconv'),
+        conv_params=conv_params,
+        collision_constraint=kwargs.get('collision_constraint', 'none'),
+        dt=kwargs.get('dt', 0.1)
     )
     
-    # Create model
-    model = BoltzmannTrafficFlow(
-        adj_mat=adj_mat,
-        input_dim=input_dim,
-        velocity_set=velocity_set,
-        hidden_dim=hidden_dim,
-        device=device
-    )
-    
-    return model.to(device)
-
-
-# Example usage
-if __name__ == "__main__":
-    # Test the model
-    device = 'cpu'
-    num_nodes = 10
-    
-    # Create random adjacency matrix
-    adj_mat = torch.rand(num_nodes, num_nodes)
-    adj_mat = (adj_mat > 0.7).float()  # Sparse connectivity
-    adj_mat.fill_diagonal_(0)  # No self loops
-    
-    # Create model
-    model = create_boltzmann_traffic_model(
-        adj_mat=adj_mat,
-        input_dim=2,
-        num_velocities=20,
-        device=device
-    )
-    
-    # Test data
-    batch_size = 4
-    input_len = 12
-    output_len = 12
-    
-    inputs = torch.rand(batch_size, input_len, num_nodes, 2)
-    targets = torch.rand(batch_size, output_len, num_nodes, 2)
-    
-    # Forward pass
-    predictions, variance_loss = model(inputs, targets)
-    
-    print(f"Input shape: {inputs.shape}")
-    print(f"Prediction shape: {predictions.shape}")
-    print(f"Variance loss: {variance_loss.item()}")
-    print("Model test passed!")
-    
-    # Check parameter groups
-    param_groups = model.get_param_groups()
-    for group in param_groups:
-        print(f"{group['name']}: {len(group['params'])} parameter groups")
+    return framework
