@@ -90,10 +90,10 @@ class CollisionOperator(nn.Module):
         # Assume equal weights w_i = 1/Q for now
         w = torch.ones(Q) / Q
         
-        C = torch.zeros(3, Q)
+        C = torch.zeros(2, Q)
         C[0, :] = w  # Mass conservation
         C[1, :] = w * self.xi_velocities  # Momentum conservation
-        C[2, :] = 0.5 * w * self.xi_velocities**2  # Energy conservation
+        # C[2, :] = 0.5 * w * self.xi_velocities**2  # Energy conservation
         
         return C
     
@@ -109,7 +109,7 @@ class CollisionOperator(nn.Module):
         I = torch.eye(self.Q_mesoscale, device=omega_raw.device)
         
         # Compute projection matrix
-        CCT_inv = torch.inverse(C @ C.T + 1e-6 * torch.eye(3, device=omega_raw.device))
+        CCT_inv = torch.inverse(C @ C.T + 1e-6 * torch.eye(2, device=omega_raw.device))
         projection = I - C.T @ CCT_inv @ C
         
         # Apply projection to each node
@@ -160,7 +160,7 @@ class SGraphRNN(nn.Module):
     Similar to GraphRNN but operates entirely in Q-dimensional space.
     """
     def __init__(self, d_features: int, Q_mesoscale: int, hidden_dim: int = 64,
-                 spatial_conv_type: str = 'diffconv', conv_params: dict = None):
+                 spatial_conv_type: str = 'gaan', conv_params: dict = None):
         super(SGraphRNN, self).__init__()
         self.d_features = d_features
         self.Q_mesoscale = Q_mesoscale
@@ -175,13 +175,6 @@ class SGraphRNN(nn.Module):
         
         # Output projection: hidden → Q (source term)
         self.output_proj = nn.Linear(hidden_dim, Q_mesoscale)
-        
-        # Initialize hidden state
-        self.hidden_dim = hidden_dim
-    
-    def init_hidden(self, batch_size, num_nodes, device):
-        """Initialize hidden state for GRU."""
-        return torch.zeros(batch_size * num_nodes, self.hidden_dim, device=device)
     
     def forward(self, graph, macro_features, hidden_state=None):
         """
@@ -472,3 +465,10 @@ def create_kinetic_framework(d_features: int = 2, Q_mesoscale: int = 16,
     )
     
     return framework
+
+if __name__ == "__main__":
+    collision = CollisionOperator(Q_mesoscale=16, constraint_type='hard',
+                                  xi_velocities=torch.linspace(0, 3, 16))
+    forward, loss = collision(torch.randn(10, 16))  # Example forward pass with random
+    print(forward.shape) # Example forward pass with random input
+    print(loss)
