@@ -467,8 +467,13 @@ def create_kinetic_framework(d_features: int = 2, Q_mesoscale: int = 16,
     return framework
 
 if __name__ == "__main__":
-    collision = CollisionOperator(Q_mesoscale=16, constraint_type='hard',
-                                  xi_velocities=torch.linspace(0, 3, 16))
-    forward, loss = collision(torch.randn(10, 16))  # Example forward pass with random
-    print(forward.shape) # Example forward pass with random input
-    print(loss)
+    S_term = SGraphRNN(d_features=2, Q_mesoscale=16, spatial_conv_type='gaan')
+    graph = dgl.graph(([0, 1, 2, 3], [1, 2, 3, 0]),num_nodes=4)
+    graph.edata['weight'] = torch.tensor([1.0, 1.0, 1.0, 1.0])  # Example edge weights
+    macro_features = torch.randn(4, 2)  # [N, d]
+    hidden_state = torch.randn(4, 64)  # [N, hidden_dim]
+    source_term, new_hidden = S_term(graph, macro_features, hidden_state)
+    print("Source Term:", source_term)
+    print("New Hidden State:", new_hidden)
+    print("Source Term Shape:", source_term.shape)
+    print("New Hidden Shape:", new_hidden.shape)
