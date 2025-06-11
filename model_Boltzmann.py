@@ -733,6 +733,7 @@ if __name__ == '__main__':
     # Initialize framework
     model = KineticForecastingFramework(
         d_features=d_features,
+        d_features_source=d_features,
         Q_mesoscale=Q_mesoscale,
         xi_velocities=xi_velocities,
         spatial_conv_type='gaan',
