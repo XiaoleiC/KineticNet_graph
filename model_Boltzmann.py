@@ -90,7 +90,7 @@ class CollisionOperator(nn.Module):
         Q = self.Q_mesoscale
         # Assume equal weights w_i = 1/Q for now
         w = torch.ones(Q) / Q
-        
+
         C = torch.zeros(2, Q)
         C[0, :] = w  # Mass conservation
         C[1, :] = w * self.xi_velocities  # Momentum conservation
@@ -424,14 +424,15 @@ class KineticForecastingFramework(nn.Module):
     """
     def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor,
                  spatial_conv_type: str = 'diffconv', conv_params: dict = None,
-                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000):
+                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu'):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
         self.d_features_source = d_features_source
         self.Q_mesoscale = Q_mesoscale
         self.decay_steps = decay_steps  # For teacher forcing decay
-        
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+
         if Q_mesoscale != xi_velocities.shape[0]:
             raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({xi_velocities.shape[0]})")
         
@@ -492,9 +493,9 @@ class KineticForecastingFramework(nn.Module):
             constraint_losses: collision invariance losses
             reconstruction_outputs: [T, N, d] reconstructed historical sequence (training only)
         """        
-        device = macro_features_sequence.device
         T = macro_features_sequence.shape[0]
-        
+        macro_features_sequence = macro_features_sequence.to(self.device)
+        target_sequence = target_sequence.to(self.device) if target_sequence is not None else None
         predictions = []
         constraint_losses = []
         reconstruction_outputs = []  # For training phase reconstruction loss
@@ -705,6 +706,7 @@ if __name__ == '__main__':
     N = 10  # Number of nodes
     T = 5   # Historical sequence length
     d_features = 1  # Macro feature dimension
+    d_features_source = 2  # Source term feature dimension
     Q_mesoscale = 6  # Mesoscale velocity components
     num_pred_steps = 5  # Prediction steps
     
@@ -722,26 +724,28 @@ if __name__ == '__main__':
     graph.ndata['out_degree'] = graph.out_degrees().float().clamp(min=1.0)
     graph.ndata['in_degree'] = graph.in_degrees().float().clamp(min=1.0)
     
+    graph = graph.to('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Graph: {N} nodes, {graph.number_of_edges()} edges")
     
     # Initialize framework
     model = KineticForecastingFramework(
         d_features=d_features,
-        d_features_source=d_features,
+        d_features_source=d_features_source,
         Q_mesoscale=Q_mesoscale,
         xi_velocities=xi_velocities,
         spatial_conv_type='gaan',
         conv_params={},
         collision_constraint='hard',
         dt=0.1,
-        decay_steps=1000
-    )
+        decay_steps=1000,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    ).to('cuda' if torch.cuda.is_available() else 'cpu')
     
     print(f"Framework initialized with {sum(p.numel() for p in model.parameters())} parameters")
     
     # Create test data
-    macro_sequence = torch.randn(T, N, d_features) * 0.5 + 1.0  # [T, N, d]
-    target_sequence = torch.randn(num_pred_steps, N, d_features) * 0.5 + 1.0  # [num_pred_steps, N, d]
+    macro_sequence = torch.randn(T, N, d_features_source) * 0.5 + 1.0  # [T, N, d]
+    target_sequence = torch.randn(num_pred_steps, N, d_features_source) * 0.5 + 1.0  # [num_pred_steps, N, d]
     
     print(f"Input sequence shape: {macro_sequence.shape}")
     print(f"Target sequence shape: {target_sequence.shape}")
@@ -761,9 +765,9 @@ if __name__ == '__main__':
         
         print("\nTesting forward pass in training mode...")
         predictions, constraint_loss, reconstructions = model(
-            graph, macro_sequence, 
+            graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'), 
             num_pred_steps=num_pred_steps,
-            target_sequence=target_sequence,
+            target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
             batch_cnt=100
         )
         
@@ -795,9 +799,9 @@ if __name__ == '__main__':
         model.source_hidden = None
         
         predictions, constraint_loss, reconstructions = model(
-            graph, macro_sequence,
+            graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
             num_pred_steps=num_pred_steps,
-            target_sequence=target_sequence,  # No targets in eval
+            target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),  # No targets in eval
             batch_cnt=100
         )
         
@@ -829,7 +833,7 @@ if __name__ == '__main__':
             predictions, _, reconstructions = model(
                 graph, macro_sequence,
                 num_pred_steps=steps,
-                target_sequence=torch.randn(steps, N, d_features),
+                target_sequence=torch.randn(steps, N, d_features_source),
                 batch_cnt=500
             )
             print(f"Steps {steps}: predictions {predictions.shape}, reconstructions {reconstructions.shape}")
@@ -839,7 +843,7 @@ if __name__ == '__main__':
         predictions, constraint_loss, _ = model(
             graph, macro_sequence,
             num_pred_steps=10,  # Longer prediction
-            target_sequence=torch.randn(10, N, d_features),
+            target_sequence=torch.randn(10, N, d_features_source),
             batch_cnt=1000
         )
         
