@@ -47,6 +47,7 @@ class MacroToMesoEncoder(nn.Module):
             meso_features: [N, Q] mesoscale distribution
         """
         meso_features = self.spatial_conv(graph, macro_features)
+        meso_features = nn.functional.relu(meso_features)
         return meso_features
 
 
@@ -409,8 +410,9 @@ class MesoToMacroDecoder(nn.Module):
         #                             dim=1, keepdim=True)
         #     macro_variables.append(higher_moment)
         
-        # Concatenate and select first d_features
-        macro_output = torch.cat(macro_variables[:self.d_features], dim=1)  # [N, d]
+        # # Concatenate and select first d_features
+        # macro_output = torch.cat(macro_variables[:self.d_features], dim=1)  # [N, d]
+        macro_output = macro_variables[1] # [N, 1], only the velocity is used for now
         
         return macro_output
 
@@ -420,24 +422,29 @@ class KineticForecastingFramework(nn.Module):
     Complete kinetic theory-informed forecasting framework.
     Integrates all five modules: Encoder → Updater ← (Collision + Source) → Decoder
     """
-    def __init__(self, d_features: int, Q_mesoscale: int, xi_velocities: torch.Tensor,
+    def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor,
                  spatial_conv_type: str = 'diffconv', conv_params: dict = None,
-                 collision_constraint: str = 'none', dt: float = 0.1):
+                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
+        self.d_features_source = d_features_source
         self.Q_mesoscale = Q_mesoscale
+        self.decay_steps = decay_steps  # For teacher forcing decay
+        
+        if Q_mesoscale != xi_velocities.shape[0]:
+            raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({xi_velocities.shape[0]})")
         
         # Module 1: MacroToMesoEncoder
-        self.macro_to_meso = MacroToMesoEncoder(d_features, Q_mesoscale, 
-                                              spatial_conv_type, conv_params)
+        self.macro_to_meso = MacroToMesoEncoder(d_features, Q_mesoscale,
+                                               spatial_conv_type, conv_params)
         
         # Module 2: BoltzmannUpdater  
         self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, xi_velocities, dt)
         
         # Module 3: SGraphRNN (for source term)
-        self.source_rnn = SGraphRNN(d_features, Q_mesoscale, 
-                                   spatial_conv_type=spatial_conv_type, 
+        self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale,
+                                   spatial_conv_type=spatial_conv_type,
                                    conv_params=conv_params)
         
         # Module 4: CollisionOperator
@@ -446,227 +453,429 @@ class KineticForecastingFramework(nn.Module):
         
         # Module 5: MesoToMacroDecoder
         self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, d_features, xi_velocities)
-        
-        # Store for source term hidden states
-        self.source_hidden = None
-    
-    def forward(self, graph, macro_features_sequence, num_pred_steps: int = 1):
+        self.source_hidden = None  # Hidden state for source term RNN
+
+    def compute_teacher_forcing_threshold(self, batch_cnt):
         """
-        Forward pass for sequence prediction.
+        Compute teacher forcing threshold based on training progress.
+        Higher values at the beginning, gradually decay to 0.
+        
+        Args:
+            batch_cnt: current batch/epoch count
+        Returns:
+            threshold: probability of using teacher forcing [0, 1]
+        """
+        import numpy as np
+        return self.decay_steps / (
+            self.decay_steps + np.exp(batch_cnt / self.decay_steps)
+        )
+
+    def forward(self, graph, macro_features_sequence, num_pred_steps: int = 1, 
+                target_sequence: torch.Tensor = None, batch_cnt: int = 0):
+        """
+        Forward pass for sequence prediction with adaptive teacher forcing.
+        
+        Logic:
+        1. Use input sequence to train source term with teacher forcing
+        2. MacroToMesoEncoder learns spatial correlations only  
+        3. Temporal evolution via Boltzmann equation (physics-informed)
+        4. Source term carries historical memory with decaying teacher forcing
         
         Args:
             graph: DGL graph
             macro_features_sequence: [T, N, d] input sequence  
             num_pred_steps: number of future steps to predict
+            target_sequence: [num_pred_steps, N, d] ground truth targets (for training)
+            batch_cnt: current batch/epoch count for teacher forcing decay
         Returns:
             predictions: [num_pred_steps, N, d] predicted macroscale variables
             constraint_losses: collision invariance losses
-        """
+            reconstruction_outputs: [T, N, d] reconstructed historical sequence (training only)
+        """        
         device = macro_features_sequence.device
-        T, N, d = macro_features_sequence.shape
+        T = macro_features_sequence.shape[0]
         
         predictions = []
         constraint_losses = []
+        reconstruction_outputs = []  # For training phase reconstruction loss
         
-        # Initialize source term hidden state
-        if self.source_hidden is None:
-            self.source_hidden = self.source_rnn.init_hidden(1, N, device)
+        # Compute teacher forcing threshold
+        teacher_forcing_threshold = self.compute_teacher_forcing_threshold(batch_cnt)
         
-        # Use last time step as initial condition
-        current_macro = macro_features_sequence[-1]  # [N, d]
+        # Phase 1: Historical sequence processing with reconstruction (training phase)
+        for t in range(T):
+            current_macro = macro_features_sequence[t]  # [N, d]
+            
+            # Update source term hidden states with ground truth data
+            source_term, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
+            
+            # During training, also compute reconstruction for loss calculation
+            if self.training:
+                # 1. Encode: macro → meso
+                f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
+                
+                # 3. Compute collision term
+                collision_term, constraint_loss = self.collision_op(f_current)
+                
+                # 4. Update using Boltzmann equation
+                f_reconstructed = self.boltzmann_updater(graph, f_current, collision_term, source_term)
+                
+                # 5. Decode: meso → macro
+                macro_reconstructed = self.meso_to_macro(f_reconstructed)  # [N, d]
+                
+                reconstruction_outputs.append(macro_reconstructed)
         
+        # Phase 2: Autoregressive prediction with adaptive teacher forcing
+        current_macro = macro_features_sequence[-1]  # [N, d] - initial condition
+
         for step in range(num_pred_steps):
-            # 1. Encode: macro → meso
+            # 1. Encode: macro → meso (spatial correlations only)
             f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
             
-            # 2. Compute source term
-            source_term, self.source_hidden = self.source_rnn(graph, current_macro, 
-                                                             self.source_hidden)
+            # 2. Adaptive teacher forcing decision for source term input
+            if (self.training and target_sequence is not None and 
+                np.random.random() < teacher_forcing_threshold):
+                # Use ground truth for source term (teacher forcing)
+                source_input = target_sequence[step]  # [N, d]
+            else:
+                # Use model prediction for source term
+                source_input = current_macro  # [N, d]
+            # 3. Compute source term (carries historical memory)
+            source_term, self.source_hidden = self.source_rnn(graph, source_input, 
+                                                              self.source_hidden)
             
-            # 3. Compute collision term
+            # 4. Compute collision term (physical constraints)
             collision_term, constraint_loss = self.collision_op(f_current)
             constraint_losses.append(constraint_loss)
             
-            # 4. Update using Boltzmann equation
+            # 5. Update using Boltzmann equation (physics-informed temporal evolution)
             f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
             
-            # 5. Decode: meso → macro
+            # 6. Decode: meso → macro
             macro_next = self.meso_to_macro(f_next)  # [N, d]
             
             predictions.append(macro_next)
-            current_macro = macro_next  # Update for next iteration
+            current_macro = macro_next  # Update for next iteration??
+            
         
         predictions = torch.stack(predictions, dim=0)  # [num_pred_steps, N, d]
-        total_constraint_loss = torch.stack(constraint_losses).mean()
+        total_constraint_loss = torch.stack(constraint_losses).mean() if constraint_losses else torch.tensor(0.0)
         
-        return predictions, total_constraint_loss
-    
-    def reset_source_hidden(self):
-        """Reset source term hidden state."""
-        self.source_hidden = None
+        # Stack reconstruction outputs if in training mode
+        if self.training and reconstruction_outputs:
+            reconstruction_outputs = torch.stack(reconstruction_outputs, dim=0)  # [T, N, d]
+        else:
+            reconstruction_outputs = None
+        
+        return predictions, total_constraint_loss, reconstruction_outputs
 
 
-# Example usage and initialization
-def create_kinetic_framework(d_features: int = 2, Q_mesoscale: int = 16, 
-                           xi_range: tuple = (-3, 3), **kwargs):
-    """
-    Helper function to create the kinetic framework with default parameters.
-    """
-    # Create velocity discretization
-    xi_velocities = torch.linspace(xi_range[0], xi_range[1], Q_mesoscale)
+# if __name__ == '__main__':
+#     """
+#     Test BoltzmannUpdater module independently
+#     """
+#     import time
+#     print("Testing BoltzmannUpdater...")
+#     t0 = time.time()
+#     torch.manual_seed(42)  # For reproducibility
+#     np.random.seed(42)
+#     # Test parameters
+#     N = 5  # Number of nodes
+#     Q = 3  # Number of velocity components
     
-    # Default conv_params for different spatial convolution types
-    if kwargs.get('spatial_conv_type') == 'gaan':
-        conv_params = {
-            'map_feats': kwargs.get('map_feats', 64),
-            'num_heads': kwargs.get('num_heads', 2)
-        }
-    else:  # diffconv
-        conv_params = {
-            'k': kwargs.get('k', 2),
-            'in_graph_list': kwargs.get('in_graph_list', []),
-            'out_graph_list': kwargs.get('out_graph_list', [])
-        }
+#     # Create a simple directed graph
+#     edges = [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3), (3, 4)]
+#     src, dst = zip(*edges)
+#     graph = dgl.graph((src, dst), num_nodes=N)
     
-    framework = KineticForecastingFramework(
-        d_features=d_features,
-        Q_mesoscale=Q_mesoscale, 
-        xi_velocities=xi_velocities,
-        spatial_conv_type=kwargs.get('spatial_conv_type', 'diffconv'),
-        conv_params=conv_params,
-        collision_constraint=kwargs.get('collision_constraint', 'none'),
-        dt=kwargs.get('dt', 0.1)
-    )
+#     # Add edge weights (representing 1/distance)
+#     graph.edata['weight'] = torch.rand(graph.number_of_edges()) * 0.5 + 0.5
     
-    return framework
+#     # Add degree information
+#     graph.ndata['out_degree'] = graph.out_degrees().float().clamp(min=1.0)
+#     graph.ndata['in_degree'] = graph.in_degrees().float().clamp(min=1.0)
+    
+#     print(f"Graph info: {N} nodes, {graph.number_of_edges()} edges")
+#     print(f"Out degrees: {graph.ndata['out_degree']}")
+#     print(f"In degrees: {graph.ndata['in_degree']}")
+    
+#     # Create velocity grid (all positive values)
+#     xi_velocities = torch.tensor([0.5, 1.0, 2.0])
+#     print(f"Velocity grid: {xi_velocities}")
+    
+#     # Initialize BoltzmannUpdater
+#     dt = 0.1
+#     updater = BoltzmannUpdater(Q, xi_velocities, dt)
+    
+#     # Create test distribution function
+#     f_distribution = torch.rand(N, Q) * 2.0 + 1.0  # [N, Q] positive values
+#     print(f"Initial distribution shape: {f_distribution.shape}")
+#     print(f"Initial distribution:\n{f_distribution}")
+    
+#     # Create dummy collision and source terms
+#     collision_term = CollisionOperator(Q, constraint_type='hard', xi_velocities=xi_velocities)
+#     collision_term = collision_term(f_distribution)[0]  # [N, Q]
+#     print(f"Collision term shape: {collision_term.shape}")
+#     source_term = torch.rand(N, Q) * 0.05    # Small source term
+    
+#     print("\n" + "="*50)
+#     print("Testing compute_transport_term...")
+    
+#     # Test transport term computation
+#     try:
+#         transport_term = updater.compute_transport_term(graph, f_distribution)
+#         print(f"Transport term computed successfully!")
+#         print(f"Transport term shape: {transport_term.shape}")
+#         print(f"Transport term range: [{transport_term.min():.4f}, {transport_term.max():.4f}]")
+#         print(f"Transport term:\n{transport_term}")
+        
+#         # Check for NaN or infinite values
+#         if torch.isnan(transport_term).any():
+#             print("Warning: NaN values detected in transport term")
+#         if torch.isinf(transport_term).any():
+#             print("Warning: Infinite values detected in transport term")
+            
+#     except Exception as e:
+#         print(f"Error in transport term computation: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         exit(1)
+    
+#     print("\n" + "="*50)
+#     print("Testing full Boltzmann update...")
+    
+#     # Test full update
+#     try:
+#         f_new = updater.forward(graph, f_distribution, collision_term, source_term)
+#         print(f"Boltzmann update completed successfully!")
+#         print(f"Updated distribution shape: {f_new.shape}")
+#         print(f"Updated distribution range: [{f_new.min():.4f}, {f_new.max():.4f}]")
+        
+#         # Check conservation properties
+#         mass_before = f_distribution.sum()
+#         mass_after = f_new.sum()
+#         mass_change = abs(mass_after - mass_before) / mass_before
+#         print(f"Mass change: {mass_change:.6f} (relative)")
+        
+#         if mass_change < 0.01:
+#             print("Mass approximately conserved")
+#         else:
+#             print("Warning: Significant mass change detected")
+            
+#         # Check for negative values
+#         if (f_new < 0).any():
+#             print("Warning: Negative distribution values detected")
+#             neg_count = (f_new < 0).sum().item()
+#             print(f"   Number of negative values: {neg_count}")
+#         else:
+#             print("All distribution values remain positive")
+            
+#         # Show the change
+#         f_change = f_new - f_distribution
+#         print(f"Distribution change range: [{f_change.min():.4f}, {f_change.max():.4f}]")
+        
+#     except Exception as e:
+#         print(f"Error in Boltzmann update: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         exit(1)
+    
+#     print("\n" + "="*50)
+#     print("All tests passed! BoltzmannUpdater is working correctly.")
+    
+#     # Additional test: multiple time steps
+#     print("\nTesting multiple time steps...")
+#     f_current = f_distribution.clone()
+    
+#     for step in range(5):
+#         collision_term = torch.rand(N, Q) * 0.05
+#         source_term = torch.rand(N, Q) * 0.02
+#         f_current = updater.forward(graph, f_current, collision_term, source_term)
+#         print(f"Step {step+1}: mass = {f_current.sum():.4f}, range = [{f_current.min():.4f}, {f_current.max():.4f}]")
+        
+#         if torch.isnan(f_current).any():
+#             print(f"NaN detected at step {step+1}")
+#             break
+#     else:
+#         print("Multi-step simulation completed successfully!")
+
+#     print(f"Total time: {time.time() - t0:.4f} seconds")
 
 if __name__ == '__main__':
     """
-    Test BoltzmannUpdater module independently
+    Test KineticForecastingFramework integration
     """
-    import time
-    print("Testing BoltzmannUpdater...")
-    t0 = time.time()
-    torch.manual_seed(42)  # For reproducibility
-    np.random.seed(42)
-    # Test parameters
-    N = 5  # Number of nodes
-    Q = 3  # Number of velocity components
+    print("Testing KineticForecastingFramework...")
     
-    # Create a simple directed graph
-    edges = [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3), (3, 4)]
+    # Test parameters
+    N = 10  # Number of nodes
+    T = 5   # Historical sequence length
+    d_features = 1  # Macro feature dimension
+    Q_mesoscale = 6  # Mesoscale velocity components
+    num_pred_steps = 5  # Prediction steps
+    
+    # Create velocity grid
+    xi_velocities = torch.randn(Q_mesoscale)
+    
+    # Create test graph
+    edges = [(i, (i+1) % N) for i in range(N)]  # Ring graph
+    edges += [(i, (i+2) % N) for i in range(N)]  # Add some long-range connections
     src, dst = zip(*edges)
     graph = dgl.graph((src, dst), num_nodes=N)
     
-    # Add edge weights (representing 1/distance)
+    # Add graph properties
     graph.edata['weight'] = torch.rand(graph.number_of_edges()) * 0.5 + 0.5
-    
-    # Add degree information
     graph.ndata['out_degree'] = graph.out_degrees().float().clamp(min=1.0)
     graph.ndata['in_degree'] = graph.in_degrees().float().clamp(min=1.0)
     
-    print(f"Graph info: {N} nodes, {graph.number_of_edges()} edges")
-    print(f"Out degrees: {graph.ndata['out_degree']}")
-    print(f"In degrees: {graph.ndata['in_degree']}")
+    print(f"Graph: {N} nodes, {graph.number_of_edges()} edges")
     
-    # Create velocity grid (all positive values)
-    xi_velocities = torch.tensor([0.5, 1.0, 2.0])
-    print(f"Velocity grid: {xi_velocities}")
+    # Initialize framework
+    model = KineticForecastingFramework(
+        d_features=d_features,
+        Q_mesoscale=Q_mesoscale,
+        xi_velocities=xi_velocities,
+        spatial_conv_type='gaan',
+        conv_params={},
+        collision_constraint='hard',
+        dt=0.1,
+        decay_steps=1000
+    )
     
-    # Initialize BoltzmannUpdater
-    dt = 0.1
-    updater = BoltzmannUpdater(Q, xi_velocities, dt)
+    print(f"Framework initialized with {sum(p.numel() for p in model.parameters())} parameters")
     
-    # Create test distribution function
-    f_distribution = torch.rand(N, Q) * 2.0 + 1.0  # [N, Q] positive values
-    print(f"Initial distribution shape: {f_distribution.shape}")
-    print(f"Initial distribution:\n{f_distribution}")
+    # Create test data
+    macro_sequence = torch.randn(T, N, d_features) * 0.5 + 1.0  # [T, N, d]
+    target_sequence = torch.randn(num_pred_steps, N, d_features) * 0.5 + 1.0  # [num_pred_steps, N, d]
     
-    # Create dummy collision and source terms
-    collision_term = CollisionOperator(Q, constraint_type='hard', xi_velocities=xi_velocities)
-    collision_term = collision_term(f_distribution)[0]  # [N, Q]
-    print(f"Collision term shape: {collision_term.shape}")
-    source_term = torch.rand(N, Q) * 0.05    # Small source term
+    print(f"Input sequence shape: {macro_sequence.shape}")
+    print(f"Target sequence shape: {target_sequence.shape}")
     
-    print("\n" + "="*50)
-    print("Testing compute_transport_term...")
+    print("\n" + "="*60)
+    print("Testing Training Mode...")
     
-    # Test transport term computation
+    # Test training mode
+    model.train()
+    print(f"Training mode: {model.training}")
+    
     try:
-        transport_term = updater.compute_transport_term(graph, f_distribution)
-        print(f"Transport term computed successfully!")
-        print(f"Transport term shape: {transport_term.shape}")
-        print(f"Transport term range: [{transport_term.min():.4f}, {transport_term.max():.4f}]")
-        print(f"Transport term:\n{transport_term}")
+        # Test teacher forcing threshold
+        for batch_cnt in [0, 500, 1000, 2000, 5000]:
+            threshold = model.compute_teacher_forcing_threshold(batch_cnt)
+            print(f"Batch {batch_cnt}: Teacher forcing threshold = {threshold:.4f}")
         
-        # Check for NaN or infinite values
-        if torch.isnan(transport_term).any():
-            print("Warning: NaN values detected in transport term")
-        if torch.isinf(transport_term).any():
-            print("Warning: Infinite values detected in transport term")
-            
+        print("\nTesting forward pass in training mode...")
+        predictions, constraint_loss, reconstructions = model(
+            graph, macro_sequence, 
+            num_pred_steps=num_pred_steps,
+            target_sequence=target_sequence,
+            batch_cnt=100
+        )
+        
+        print(f"Training forward pass successful!")
+        print(f"Predictions shape: {predictions.shape}")
+        print(f"Constraint loss: {constraint_loss.item():.4f}")
+        print(f"Reconstructions shape: {reconstructions.shape if reconstructions is not None else None}")
+        
+        # Check shapes
+        assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
+        assert reconstructions.shape == (T, N, d_features), f"Wrong reconstructions shape: {reconstructions.shape}"
+        print("Training mode shapes correct!")
+        
     except Exception as e:
-        print(f"Error in transport term computation: {e}")
+        print(f"Training mode error: {e}")
         import traceback
         traceback.print_exc()
         exit(1)
     
-    print("\n" + "="*50)
-    print("Testing full Boltzmann update...")
+    print("\n" + "="*60)
+    print("Testing Evaluation Mode...")
     
-    # Test full update
+    # Test evaluation mode
+    model.eval()
+    print(f"Training mode: {model.training}")
+    
     try:
-        f_new = updater.forward(graph, f_distribution, collision_term, source_term)
-        print(f"Boltzmann update completed successfully!")
-        print(f"Updated distribution shape: {f_new.shape}")
-        print(f"Updated distribution range: [{f_new.min():.4f}, {f_new.max():.4f}]")
+        # Reset hidden state
+        model.source_hidden = None
         
-        # Check conservation properties
-        mass_before = f_distribution.sum()
-        mass_after = f_new.sum()
-        mass_change = abs(mass_after - mass_before) / mass_before
-        print(f"Mass change: {mass_change:.6f} (relative)")
+        predictions, constraint_loss, reconstructions = model(
+            graph, macro_sequence,
+            num_pred_steps=num_pred_steps,
+            target_sequence=None,  # No targets in eval
+            batch_cnt=100
+        )
         
-        if mass_change < 0.01:
-            print("Mass approximately conserved")
-        else:
-            print("Warning: Significant mass change detected")
-            
-        # Check for negative values
-        if (f_new < 0).any():
-            print("Warning: Negative distribution values detected")
-            neg_count = (f_new < 0).sum().item()
-            print(f"   Number of negative values: {neg_count}")
-        else:
-            print("All distribution values remain positive")
-            
-        # Show the change
-        f_change = f_new - f_distribution
-        print(f"Distribution change range: [{f_change.min():.4f}, {f_change.max():.4f}]")
+        print(f"Evaluation forward pass successful!")
+        print(f"Predictions shape: {predictions.shape}")
+        print(f"Constraint loss: {constraint_loss.item():.4f}")
+        print(f"Reconstructions: {reconstructions}")  # Should be None
+        
+        # Check shapes
+        assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
+        assert reconstructions is None, "Reconstructions should be None in eval mode"
+        print("Evaluation mode shapes correct!")
         
     except Exception as e:
-        print(f"Error in Boltzmann update: {e}")
+        print(f"Evaluation mode error: {e}")
         import traceback
         traceback.print_exc()
         exit(1)
     
-    print("\n" + "="*50)
-    print("All tests passed! BoltzmannUpdater is working correctly.")
+    print("\n" + "="*60)
+    print("Testing Multiple Steps and Consistency...")
     
-    # Additional test: multiple time steps
-    print("\nTesting multiple time steps...")
-    f_current = f_distribution.clone()
-    
-    for step in range(5):
-        collision_term = torch.rand(N, Q) * 0.05
-        source_term = torch.rand(N, Q) * 0.02
-        f_current = updater.forward(graph, f_current, collision_term, source_term)
-        print(f"Step {step+1}: mass = {f_current.sum():.4f}, range = [{f_current.min():.4f}, {f_current.max():.4f}]")
+    try:
+        model.train()
         
-        if torch.isnan(f_current).any():
-            print(f"NaN detected at step {step+1}")
-            break
-    else:
-        print("Multi-step simulation completed successfully!")
-
-    print(f"Total time: {time.time() - t0:.4f} seconds")
+        # Test different prediction lengths
+        for steps in [1, 3, 5]:
+            model.source_hidden = None
+            predictions, _, reconstructions = model(
+                graph, macro_sequence,
+                num_pred_steps=steps,
+                target_sequence=torch.randn(steps, N, d_features),
+                batch_cnt=500
+            )
+            print(f"Steps {steps}: predictions {predictions.shape}, reconstructions {reconstructions.shape}")
+        
+        # Test numerical stability
+        model.source_hidden = None
+        predictions, constraint_loss, _ = model(
+            graph, macro_sequence,
+            num_pred_steps=10,  # Longer prediction
+            target_sequence=torch.randn(10, N, d_features),
+            batch_cnt=1000
+        )
+        
+        if torch.isnan(predictions).any():
+            print("Warning: NaN values detected in predictions")
+        else:
+            print("No NaN values in extended predictions")
+            
+        if torch.isinf(predictions).any():
+            print("Warning: Infinite values detected in predictions")
+        else:
+            print("No infinite values in extended predictions")
+        
+        print(f"Extended prediction range: [{predictions.min():.4f}, {predictions.max():.4f}]")
+        
+    except Exception as e:
+        print(f"Multi-step test error: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+    
+    print("\n" + "="*60)
+    print("All tests passed! KineticForecastingFramework is working correctly.")
+    
+    print("\nFramework Summary:")
+    print(f"- Input features: {d_features}")
+    print(f"- Mesoscale components: {Q_mesoscale}")
+    print(f"- Velocity grid: {xi_velocities}")
+    print(f"- Total parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f"- Decay steps: {model.decay_steps}")
+    print(f"- Training mode support: pass")
+    print(f"- Teacher forcing: pass")
+    print(f"- Reconstruction loss: pass")
+    print(f"- Multi-step prediction: pass")
