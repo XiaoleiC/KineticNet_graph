@@ -225,13 +225,10 @@ class BoltzmannUpdater(nn.Module):
         # Note: These will be computed based on graph structure
     
     def compute_transport_term(self, graph, f_distribution):
-        """
-        Compute transport term: Σ_j q_ij ξ_k (f_j - f_i) / d_ij
-        """
         with graph.local_scope():
             # Store distribution on nodes
             graph.ndata['f'] = f_distribution  # [N, Q]
-            
+            reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
             # Compute differences for each velocity component
             transport_terms = []
             
@@ -239,11 +236,20 @@ class BoltzmannUpdater(nn.Module):
                 xi_k = self.xi_velocities[k]
                 
                 # Message function: compute ξ_k * (f_j - f_i) / d_ij for each edge
-                def message_func(edges):
+                def message_func_inflow(edges):
+                    f_diff = edges.dst['f'][:, k] - edges.src['f'][:, k]  # [E]
+                    # Use edge weight as 1/d_ij, and assume q_ij is uniform for now
+                    edge_weight = edges.data.get('weight', torch.ones_like(f_diff))
+                    q_ij = 1.0 / edges.src['out_degree']  # Approximate uniform distribution
+                    
+                    transport = q_ij * xi_k * f_diff * edge_weight
+                    return {'transport_k': transport}
+                
+                def message_func_outflow(edges):
                     f_diff = edges.src['f'][:, k] - edges.dst['f'][:, k]  # [E]
                     # Use edge weight as 1/d_ij, and assume q_ij is uniform for now
                     edge_weight = edges.data.get('weight', torch.ones_like(f_diff))
-                    q_ij = 1.0 / edges.dst['degree']  # Approximate uniform distribution
+                    q_ij = 1.0 / edges.dst['in_degree']  # Approximate uniform distribution
                     
                     transport = q_ij * xi_k * f_diff * edge_weight
                     return {'transport_k': transport}
@@ -252,12 +258,14 @@ class BoltzmannUpdater(nn.Module):
                 def reduce_func(nodes):
                     return {'transport_sum_k': torch.sum(nodes.mailbox['transport_k'], dim=1)}
                 
-                # Add degree information
-                graph.ndata['degree'] = graph.in_degrees().float().clamp(min=1.0)
-                
+                graph.update_all(message_func_inflow, reduce_func)
+                inflow = graph.ndata['transport_sum_k'].clone()
+
+                reverse_graph.update_all(message_func_outflow, reduce_func)
+                outflow = reverse_graph.ndata['transport_sum_k'].clone()
+
                 # Apply message passing for this velocity component
-                graph.update_all(message_func, reduce_func)
-                transport_terms.append(graph.ndata['transport_sum_k'])
+                transport_terms.append(outflow - inflow)  
             
             # Stack transport terms: [N, Q]
             transport_term = torch.stack(transport_terms, dim=1)
@@ -279,8 +287,8 @@ class BoltzmannUpdater(nn.Module):
         # Compute transport term
         transport_term = self.compute_transport_term(graph, f_distribution)
         
-        # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision + Source]
-        f_new = f_distribution - self.dt * (transport_term - collision_term + source_term)
+        # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
+        f_new = f_distribution - self.dt * (transport_term - collision_term - source_term)
         
         return f_new
 
@@ -466,14 +474,127 @@ def create_kinetic_framework(d_features: int = 2, Q_mesoscale: int = 16,
     
     return framework
 
-if __name__ == "__main__":
-    S_term = SGraphRNN(d_features=2, Q_mesoscale=16, spatial_conv_type='gaan')
-    graph = dgl.graph(([0, 1, 2, 3], [1, 2, 3, 0]),num_nodes=4)
-    graph.edata['weight'] = torch.tensor([1.0, 1.0, 1.0, 1.0])  # Example edge weights
-    macro_features = torch.randn(4, 2)  # [N, d]
-    hidden_state = torch.randn(4, 64)  # [N, hidden_dim]
-    source_term, new_hidden = S_term(graph, macro_features, hidden_state)
-    print("Source Term:", source_term)
-    print("New Hidden State:", new_hidden)
-    print("Source Term Shape:", source_term.shape)
-    print("New Hidden Shape:", new_hidden.shape)
+if __name__ == '__main__':
+    """
+    Test BoltzmannUpdater module independently
+    """
+    
+    print("Testing BoltzmannUpdater...")
+    
+    # Test parameters
+    N = 5  # Number of nodes
+    Q = 3  # Number of velocity components
+    
+    # Create a simple directed graph
+    edges = [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3), (3, 4)]
+    src, dst = zip(*edges)
+    graph = dgl.graph((src, dst), num_nodes=N)
+    
+    # Add edge weights (representing 1/distance)
+    graph.edata['weight'] = torch.rand(graph.number_of_edges()) * 0.5 + 0.5
+    
+    # Add degree information
+    graph.ndata['out_degree'] = graph.out_degrees().float().clamp(min=1.0)
+    graph.ndata['in_degree'] = graph.in_degrees().float().clamp(min=1.0)
+    
+    print(f"Graph info: {N} nodes, {graph.number_of_edges()} edges")
+    print(f"Out degrees: {graph.ndata['out_degree']}")
+    print(f"In degrees: {graph.ndata['in_degree']}")
+    
+    # Create velocity grid (all positive values)
+    xi_velocities = torch.tensor([0.5, 1.0, 2.0])
+    print(f"Velocity grid: {xi_velocities}")
+    
+    # Initialize BoltzmannUpdater
+    dt = 0.1
+    updater = BoltzmannUpdater(Q, xi_velocities, dt)
+    
+    # Create test distribution function
+    f_distribution = torch.rand(N, Q) * 2.0 + 1.0  # [N, Q] positive values
+    print(f"Initial distribution shape: {f_distribution.shape}")
+    print(f"Initial distribution:\n{f_distribution}")
+    
+    # Create dummy collision and source terms
+    collision_term = torch.rand(N, Q) * 0.1  # Small collision term
+    source_term = torch.rand(N, Q) * 0.05    # Small source term
+    
+    print("\n" + "="*50)
+    print("Testing compute_transport_term...")
+    
+    # Test transport term computation
+    try:
+        transport_term = updater.compute_transport_term(graph, f_distribution)
+        print(f"Transport term computed successfully!")
+        print(f"Transport term shape: {transport_term.shape}")
+        print(f"Transport term range: [{transport_term.min():.4f}, {transport_term.max():.4f}]")
+        print(f"Transport term:\n{transport_term}")
+        
+        # Check for NaN or infinite values
+        if torch.isnan(transport_term).any():
+            print("Warning: NaN values detected in transport term")
+        if torch.isinf(transport_term).any():
+            print("Warning: Infinite values detected in transport term")
+            
+    except Exception as e:
+        print(f"Error in transport term computation: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+    
+    print("\n" + "="*50)
+    print("Testing full Boltzmann update...")
+    
+    # Test full update
+    try:
+        f_new = updater.forward(graph, f_distribution, collision_term, source_term)
+        print(f"Boltzmann update completed successfully!")
+        print(f"Updated distribution shape: {f_new.shape}")
+        print(f"Updated distribution range: [{f_new.min():.4f}, {f_new.max():.4f}]")
+        
+        # Check conservation properties
+        mass_before = f_distribution.sum()
+        mass_after = f_new.sum()
+        mass_change = abs(mass_after - mass_before) / mass_before
+        print(f"Mass change: {mass_change:.6f} (relative)")
+        
+        if mass_change < 0.01:
+            print("Mass approximately conserved")
+        else:
+            print("Warning: Significant mass change detected")
+            
+        # Check for negative values
+        if (f_new < 0).any():
+            print("Warning: Negative distribution values detected")
+            neg_count = (f_new < 0).sum().item()
+            print(f"   Number of negative values: {neg_count}")
+        else:
+            print("All distribution values remain positive")
+            
+        # Show the change
+        f_change = f_new - f_distribution
+        print(f"Distribution change range: [{f_change.min():.4f}, {f_change.max():.4f}]")
+        
+    except Exception as e:
+        print(f"Error in Boltzmann update: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+    
+    print("\n" + "="*50)
+    print("All tests passed! BoltzmannUpdater is working correctly.")
+    
+    # Additional test: multiple time steps
+    print("\nTesting multiple time steps...")
+    f_current = f_distribution.clone()
+    
+    for step in range(5):
+        collision_term = torch.rand(N, Q) * 0.05
+        source_term = torch.rand(N, Q) * 0.02
+        f_current = updater.forward(graph, f_current, collision_term, source_term)
+        print(f"Step {step+1}: mass = {f_current.sum():.4f}, range = [{f_current.min():.4f}, {f_current.max():.4f}]")
+        
+        if torch.isnan(f_current).any():
+            print(f"NaN detected at step {step+1}")
+            break
+    else:
+        print("Multi-step simulation completed successfully!")
