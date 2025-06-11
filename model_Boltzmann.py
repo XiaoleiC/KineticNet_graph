@@ -395,19 +395,19 @@ class MesoToMacroDecoder(nn.Module):
         velocity = momentum / (density + 1e-8)  # Avoid division by zero
         macro_variables.append(velocity)
         
-        # Higher moments can be added based on d_features
-        if self.d_features > 2:
-            # 2nd moment: energy/temperature related
-            energy = torch.sum(f_distribution * self.weights * self.xi_velocities**2, dim=1, keepdim=True)
-            macro_variables.append(energy)
+        # # Higher moments can be added based on d_features
+        # if self.d_features > 2:
+        #     # 2nd moment: energy/temperature related
+        #     energy = torch.sum(f_distribution * self.weights * self.xi_velocities**2, dim=1, keepdim=True)
+        #     macro_variables.append(energy)
         
-        # Add more moments as needed to match d_features
-        while len(macro_variables) < self.d_features:
-            # Add higher order moments or other derived quantities
-            moment_order = len(macro_variables)
-            higher_moment = torch.sum(f_distribution * self.weights * (self.xi_velocities**moment_order), 
-                                    dim=1, keepdim=True)
-            macro_variables.append(higher_moment)
+        # # Add more moments as needed to match d_features
+        # while len(macro_variables) < self.d_features:
+        #     # Add higher order moments or other derived quantities
+        #     moment_order = len(macro_variables)
+        #     higher_moment = torch.sum(f_distribution * self.weights * (self.xi_velocities**moment_order), 
+        #                             dim=1, keepdim=True)
+        #     macro_variables.append(higher_moment)
         
         # Concatenate and select first d_features
         macro_output = torch.cat(macro_variables[:self.d_features], dim=1)  # [N, d]
