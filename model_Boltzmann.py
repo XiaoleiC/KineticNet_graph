@@ -507,21 +507,15 @@ class KineticForecastingFramework(nn.Module):
             current_macro = macro_features_sequence[t]  # [N, d]
             
             # Update source term hidden states with ground truth data
-            source_term, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
+            _, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
             
             # During training, also compute reconstruction for loss calculation
             if self.training:
                 # 1. Encode: macro → meso
-                f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
-                
-                # 3. Compute collision term
-                collision_term, constraint_loss = self.collision_op(f_current)
-                
-                # 4. Update using Boltzmann equation
-                f_reconstructed = self.boltzmann_updater(graph, f_current, collision_term, source_term)
+                f_current = self.macro_to_meso(graph, current_macro[...,:self.d_features])  # [N, Q]
                 
                 # 5. Decode: meso → macro
-                macro_reconstructed = self.meso_to_macro(f_reconstructed)  # [N, d]
+                macro_reconstructed = self.meso_to_macro(f_current)  # [N, d]
                 
                 reconstruction_outputs.append(macro_reconstructed)
         
@@ -530,7 +524,7 @@ class KineticForecastingFramework(nn.Module):
 
         for step in range(num_pred_steps):
             # 1. Encode: macro → meso (spatial correlations only)
-            f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
+            f_current = self.macro_to_meso(graph, current_macro[...,:self.d_features])  # [N, Q]
             
             # 2. Adaptive teacher forcing decision for source term input
             if (self.training and target_sequence is not None and 
@@ -555,7 +549,7 @@ class KineticForecastingFramework(nn.Module):
             macro_next = self.meso_to_macro(f_next)  # [N, d]
             
             predictions.append(macro_next)
-            current_macro = macro_next  # Update for next iteration??
+            current_macro = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # Update for next iteration??
             
         
         predictions = torch.stack(predictions, dim=0)  # [num_pred_steps, N, d]
@@ -803,7 +797,7 @@ if __name__ == '__main__':
         predictions, constraint_loss, reconstructions = model(
             graph, macro_sequence,
             num_pred_steps=num_pred_steps,
-            target_sequence=None,  # No targets in eval
+            target_sequence=target_sequence,  # No targets in eval
             batch_cnt=100
         )
         
