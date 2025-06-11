@@ -348,11 +348,13 @@ class BoltzmannUpdater(nn.Module):
         Returns:
             f_new: [N, Q] updated distribution
         """
+        f_distribution = torch.clamp(f_distribution, min=0.0)
         # Compute transport term
         transport_term = self.compute_transport_term(graph, f_distribution)
         
         # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
         f_new = f_distribution - self.dt * (transport_term - collision_term - source_term)
+        f_new = torch.clamp(f_new, min=0.0)
         
         return f_new
 
