@@ -42,6 +42,7 @@ def train(
     model.train()
     batch_size = args.batch_size
     for i, (x, y) in enumerate(dataloader):
+        model.source_hidden = None
         optimizer.zero_grad()
         # Padding: Since the diffusion graph is precmputed we need to pad the batch so that
         # each batch have same batch size
@@ -108,6 +109,7 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
     model.eval()
     batch_size = args.batch_size
     for i, (x, y) in enumerate(dataloader):
+        model.source_hidden = None
         # Padding: Since the diffusion graph is precmputed we need to pad the batch so that
         # each batch have same batch size
         if x.shape[0] != batch_size:
@@ -143,9 +145,12 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
         y = y.reshape(x.shape[0], -1, x.shape[3]).to(device)
 
         batch_graph = dgl.batch([graph] * batch_size)
-        output = model(batch_graph, x_norm, y_norm, i, device)
+        output, y_reconstruct = model(graph = batch_graph, macro_features=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
         y_pred = normalizer.denormalize(output)
-        loss = loss_fn(y_pred, y[...,:1])
+
+        loss_predict = loss_fn(y_pred, y[...,:1])
+        loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
+        loss = loss_predict + loss_reconstruct
         total_loss.append(float(loss))
     return np.mean(total_loss)
 
@@ -293,14 +298,14 @@ if __name__ == "__main__":
             device,
             args,
         )
-        # valid_loss = eval(
-        #     dcrnn, g, valid_loader, normalizer, loss_fn, device, args
-        # )
-        # test_loss = eval(
-        #     dcrnn, g, test_loader, normalizer, loss_fn, device, args
-        # )
-        # print(
-        #     "\rEpoch: {} Train Loss: {} Valid Loss: {} Test Loss: {}".format(
-        #         e, train_loss, valid_loss, test_loss
-        #     )
-        # )
+        valid_loss = eval(
+            dcrnn, g, valid_loader, normalizer, loss_fn, device, args
+        )
+        test_loss = eval(
+            dcrnn, g, test_loader, normalizer, loss_fn, device, args
+        )
+        print(
+            "\rEpoch: {} Train Loss: {} Valid Loss: {} Test Loss: {}".format(
+                e, train_loss, valid_loss, test_loss
+            )
+        )

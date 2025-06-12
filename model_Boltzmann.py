@@ -559,7 +559,7 @@ class KineticForecastingFramework(nn.Module):
             predictions.append(macro_next)
             current_macro = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # Update for next iteration??
             
-        
+        self.source_hidden = None  # Reset source hidden state after prediction
         predictions = torch.stack(predictions, dim=0)  # [num_pred_steps, N, d]
         # total_constraint_loss = torch.stack(constraint_losses).mean() if constraint_losses else torch.tensor(0.0)
         
