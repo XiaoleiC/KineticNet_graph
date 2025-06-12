@@ -78,7 +78,12 @@ def train(
         y = y.reshape(y.shape[0], -1, y.shape[3]).float().to(device)
 
         batch_graph = dgl.batch([graph] * batch_size)
-        output, constraint_loss, reconstruct = model(batch_graph, x_norm, y_norm, batch_cnt[0], device)
+        if x_norm.shape != y_norm.shape:
+            raise ValueError(
+                f"Shape mismatch: x_norm {x_norm.shape} vs y_norm {y_norm.shape}"
+            )
+
+        output, constraint_loss, reconstruct = model(graph=batch_graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
         # Denormalization for loss compute
         y_reconstruct = normalizer.denormalize(reconstruct)
         y_pred = normalizer.denormalize(output)
@@ -288,14 +293,14 @@ if __name__ == "__main__":
             device,
             args,
         )
-        valid_loss = eval(
-            dcrnn, g, valid_loader, normalizer, loss_fn, device, args
-        )
-        test_loss = eval(
-            dcrnn, g, test_loader, normalizer, loss_fn, device, args
-        )
-        print(
-            "\rEpoch: {} Train Loss: {} Valid Loss: {} Test Loss: {}".format(
-                e, train_loss, valid_loss, test_loss
-            )
-        )
+        # valid_loss = eval(
+        #     dcrnn, g, valid_loader, normalizer, loss_fn, device, args
+        # )
+        # test_loss = eval(
+        #     dcrnn, g, test_loader, normalizer, loss_fn, device, args
+        # )
+        # print(
+        #     "\rEpoch: {} Train Loss: {} Valid Loss: {} Test Loss: {}".format(
+        #         e, train_loss, valid_loss, test_loss
+        #     )
+        # )

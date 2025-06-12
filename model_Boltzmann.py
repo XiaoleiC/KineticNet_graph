@@ -90,7 +90,7 @@ class CollisionOperator(nn.Module):
         Q = self.Q_mesoscale
         # Assume equal weights w_i = 1/Q for now
         w = torch.ones(Q) / Q
-
+        w = w.to(self.xi_velocities.device)
         C = torch.zeros(2, Q)
         C[0, :] = w  # Mass conservation
         C[1, :] = w * self.xi_velocities  # Momentum conservation

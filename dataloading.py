@@ -60,7 +60,7 @@ class METR_LATrainDataset(SnapShotDataset):
 class METR_LATestDataset(SnapShotDataset):
     def __init__(self):
         super(METR_LATestDataset, self).__init__("data", "metr_la_test.npz")
-
+# the unit seems to be mile/hour
 
 class METR_LAValidDataset(SnapShotDataset):
     def __init__(self):
