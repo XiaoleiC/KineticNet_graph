@@ -83,7 +83,7 @@ def train(
                 f"Shape mismatch: x_norm {x_norm.shape} vs y_norm {y_norm.shape}"
             )
 
-        output, constraint_loss, reconstruct = model(graph=batch_graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
+        output, reconstruct = model(graph=batch_graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
         # Denormalization for loss compute
         y_reconstruct = normalizer.denormalize(reconstruct)
         y_pred = normalizer.denormalize(output)
@@ -98,7 +98,7 @@ def train(
         total_loss.append(float(loss))
         batch_cnt[0] += 1
         # print("\rBatch: ", i, end="")
-        print(f"\rBatch: {i} Constraint Loss: {constraint_loss:.4f} Predict Loss: {loss_predict:.4f} Reconstruct Loss: {loss_reconstruct:.4f}", end="")
+        print(f"\rBatch: {i} Predict Loss: {loss_predict:.4f} Reconstruct Loss: {loss_reconstruct:.4f}", end="")
     return np.mean(total_loss)
 
 

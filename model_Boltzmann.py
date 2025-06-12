@@ -144,15 +144,15 @@ class CollisionOperator(nn.Module):
         
         if self.constraint_type == 'hard':
             omega = self._apply_hard_constraint(omega_raw)
-            constraint_loss = torch.tensor(0.0, device=f_distribution.device)
+            # constraint_loss = torch.tensor(0.0, device=f_distribution.device)
         elif self.constraint_type == 'soft':
             omega = omega_raw
-            constraint_loss = self.compute_soft_constraint_loss(omega)
+            # constraint_loss = self.compute_soft_constraint_loss(omega)
         else:  # 'none'
             omega = omega_raw
-            constraint_loss = torch.tensor(0.0, device=f_distribution.device)
+            # constraint_loss = torch.tensor(0.0, device=f_distribution.device)
         
-        return omega, constraint_loss
+        return omega
 
 
 class SGraphRNN(nn.Module):
@@ -226,10 +226,17 @@ class BoltzmannUpdater(nn.Module):
         # Note: These will be computed based on graph structure
     
     def compute_transport_term(self, graph, f_distribution):
+        # graph = graph.clone()
+        # graph = dgl.remove_self_loop(graph)  # Remove self-loops for transport computation
         with graph.local_scope():
             # Store distribution on nodes
             graph.ndata['f'] = f_distribution  # [N, Q]
             reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
+
+            graph.ndata['out_degree'] = graph.out_degrees().float()  # [N]
+            graph.ndata['in_degree'] = graph.in_degrees().float()  # [N]
+            reverse_graph.ndata['out_degree'] = reverse_graph.out_degrees().float()
+            reverse_graph.ndata['in_degree'] = reverse_graph.in_degrees().float()
             
             # Precompute velocity matrix for broadcasting: [Q] -> [1, Q]
             xi_broadcast = self.xi_velocities.unsqueeze(0)  # [1, Q]
@@ -497,7 +504,7 @@ class KineticForecastingFramework(nn.Module):
         macro_features_sequence = macro_features_sequence.to(self.device)
         target_sequence = target_sequence.to(self.device) if target_sequence is not None else None
         predictions = []
-        constraint_losses = []
+        # constraint_losses = []
         reconstruction_outputs = []  # For training phase reconstruction loss
         
         # Compute teacher forcing threshold
@@ -540,8 +547,8 @@ class KineticForecastingFramework(nn.Module):
                                                               self.source_hidden)
             
             # 4. Compute collision term (physical constraints)
-            collision_term, constraint_loss = self.collision_op(f_current)
-            constraint_losses.append(constraint_loss)
+            collision_term = self.collision_op(f_current)
+            # constraint_losses.append(constraint_loss)
             
             # 5. Update using Boltzmann equation (physics-informed temporal evolution)
             f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
@@ -554,7 +561,7 @@ class KineticForecastingFramework(nn.Module):
             
         
         predictions = torch.stack(predictions, dim=0)  # [num_pred_steps, N, d]
-        total_constraint_loss = torch.stack(constraint_losses).mean() if constraint_losses else torch.tensor(0.0)
+        # total_constraint_loss = torch.stack(constraint_losses).mean() if constraint_losses else torch.tensor(0.0)
         
         # Stack reconstruction outputs if in training mode
         if self.training and reconstruction_outputs:
@@ -562,7 +569,7 @@ class KineticForecastingFramework(nn.Module):
         else:
             reconstruction_outputs = None
         
-        return predictions, total_constraint_loss, reconstruction_outputs
+        return predictions, reconstruction_outputs
 
 
 # if __name__ == '__main__':
