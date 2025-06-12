@@ -37,7 +37,8 @@ def train(
     device,
     args,
 ):
-    total_loss = []
+    predict_loss = []
+    reconstructed_loss = []
     graph = graph.to(device)
     model.train()
     batch_size = args.batch_size
@@ -96,15 +97,17 @@ def train(
         optimizer.step()
         if get_learning_rate(optimizer) > args.minimum_lr:
             scheduler.step()
-        total_loss.append(float(loss))
+        reconstructed_loss.append(float(loss_reconstruct))
+        predict_loss.append(float(loss_predict))
         batch_cnt[0] += 1
         # print("\rBatch: ", i, end="")
         print(f"\rBatch: {i} Predict Loss: {loss_predict:.4f} Reconstruct Loss: {loss_reconstruct:.4f}", end="")
-    return np.mean(total_loss)
+    return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
 def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
-    total_loss = []
+    predict_loss = []
+    reconstructed_loss = []
     graph = graph.to(device)
     model.eval()
     batch_size = args.batch_size
@@ -150,9 +153,9 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
 
         loss_predict = loss_fn(y_pred, y[...,:1])
         loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
-        loss = loss_predict + loss_reconstruct
-        total_loss.append(float(loss))
-    return np.mean(total_loss)
+        predict_loss.append(float(loss_predict))
+        reconstructed_loss.append(float(loss_reconstruct))
+    return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
 if __name__ == "__main__":
@@ -287,7 +290,7 @@ if __name__ == "__main__":
     loss_fn = masked_mae_loss
 
     for e in range(args.epochs):
-        train_loss = train(
+        train_loss_predict, train_loss_reconstruct = train(
             dcrnn,
             g,
             train_loader,
@@ -298,14 +301,19 @@ if __name__ == "__main__":
             device,
             args,
         )
-        valid_loss = eval(
+        valid_loss_predict, valid_loss_reconstruct = eval(
             dcrnn, g, valid_loader, normalizer, loss_fn, device, args
         )
-        test_loss = eval(
+        test_loss_predict, test_loss_reconstruct = eval(
             dcrnn, g, test_loader, normalizer, loss_fn, device, args
         )
         print(
-            "\rEpoch: {} Train Loss: {} Valid Loss: {} Test Loss: {}".format(
-                e, train_loss, valid_loss, test_loss
+            "\rEpoch: {} Train Loss Predict: {} Valid Loss Predict: {} Test Loss Predict: {}".format(
+                e, train_loss_predict, valid_loss_predict, test_loss_predict
+            )
+        )
+        print(
+            "\rEpoch: {} Train Loss Reconstruct: {} Valid Loss Reconstruct: {} Test Loss Reconstruct: {}".format(
+                e, train_loss_reconstruct, valid_loss_reconstruct, test_loss_reconstruct
             )
         )
