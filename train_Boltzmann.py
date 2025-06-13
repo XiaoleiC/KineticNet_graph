@@ -79,13 +79,13 @@ def train(
         x = x.reshape(x.shape[0], -1, x.shape[3]).float().to(device)
         y = y.reshape(y.shape[0], -1, y.shape[3]).float().to(device)
 
-        batch_graph = dgl.batch([graph] * batch_size)
-        if x_norm.shape != y_norm.shape:
-            raise ValueError(
-                f"Shape mismatch: x_norm {x_norm.shape} vs y_norm {y_norm.shape}"
-            )
+        # batch_graph = dgl.batch([graph] * batch_size)
+        # if x_norm.shape != y_norm.shape:
+        #     raise ValueError(
+        #         f"Shape mismatch: x_norm {x_norm.shape} vs y_norm {y_norm.shape}"
+        #     )
 
-        output, reconstruct = model(graph=batch_graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
+        output, reconstruct = model(graph=graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
         # Denormalization for loss compute
         y_reconstruct = normalizer.denormalize(reconstruct)
         y_pred = normalizer.denormalize(output)
@@ -147,10 +147,10 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
         x = x.reshape(x.shape[0], -1, x.shape[3]).to(device)
         y = y.reshape(y.shape[0], -1, y.shape[3]).to(device)
 
-        batch_graph = dgl.batch([graph] * batch_size)
-        output, y_reconstruct = model(graph = batch_graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
+        # batch_graph = dgl.batch([graph] * batch_size)
+        output, y_reconstruct = model(graph = graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
         y_pred = normalizer.denormalize(output)
-
+        y_reconstruct = normalizer.denormalize(y_reconstruct)
         loss_predict = loss_fn(y_pred, y[...,:1])
         loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
         predict_loss.append(float(loss_predict))
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="gaan",
+        default="diffconv",
         help="WHich model to use DCRNN vs GaAN",
     )
     parser.add_argument(
@@ -271,13 +271,25 @@ if __name__ == "__main__":
     elif args.model == "gaan":
         net = partial(GatedGAT, map_feats=64, num_heads=args.num_heads)
 
-    xi_num = 5
+    batch_g = dgl.batch([g] * args.batch_size).to(device)
+
+    k = 2
+    out_graph_list, in_graph_list = DiffConv.attach_graph(batch_g, k)
+
+    conv_params = {
+        "k": k,
+        "in_graph_list": in_graph_list,
+        "out_graph_list": out_graph_list,
+    }
+    
+    xi_num = 32
     dcrnn = GraphRNN(
         d_features=1,
         d_features_source=2,
         Q_mesoscale=xi_num,
-        xi_velocities=torch.linspace(0,20,xi_num).to(device),
+        xi_velocities=torch.linspace(0,1,xi_num).to(device),
         spatial_conv_type=args.model,
+        conv_params=conv_params,
         collision_constraint='hard',
         dt=5/60,
         decay_steps=args.decay_steps,
@@ -297,7 +309,7 @@ if __name__ == "__main__":
     for e in range(args.epochs):
         train_loss_predict, train_loss_reconstruct = train(
             dcrnn,
-            g,
+            batch_g,
             train_loader,
             optimizer,
             scheduler,
@@ -307,18 +319,18 @@ if __name__ == "__main__":
             args,
         )
         valid_loss_predict, valid_loss_reconstruct = eval(
-            dcrnn, g, valid_loader, normalizer, loss_fn, device, args
+            dcrnn, batch_g, valid_loader, normalizer, loss_fn, device, args
         )
         test_loss_predict, test_loss_reconstruct = eval(
-            dcrnn, g, test_loader, normalizer, loss_fn, device, args
+            dcrnn, batch_g, test_loader, normalizer, loss_fn, device, args
         )
         print(
-            "\rEpoch: {} Train Loss Predict: {} Valid Loss Predict: {} Test Loss Predict: {}".format(
+            "\rEpoch: {} Train Loss Predict: {:.4f} Valid Loss Predict: {:.4f} Test Loss Predict: {:.4f}".format(
                 e, train_loss_predict, valid_loss_predict, test_loss_predict
             )
         )
         print(
-            "\rEpoch: {} Train Loss Reconstruct: {} Valid Loss Reconstruct: {} Test Loss Reconstruct: {}".format(
+            "\rEpoch: {} Train Loss Reconstruct: {:.4f} Valid Loss Reconstruct: {:.4f} Test Loss Reconstruct: {:.4f}".format(
                 e, train_loss_reconstruct, valid_loss_reconstruct, test_loss_reconstruct
             )
         )

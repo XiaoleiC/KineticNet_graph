@@ -734,14 +734,24 @@ if __name__ == '__main__':
     graph = graph.to('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Graph: {N} nodes, {graph.number_of_edges()} edges")
     
+    k = 2
+    out_graph_list, in_graph_list = DiffConv.attach_graph(graph, k)
+
+    conv_params = {
+        "k": k,
+        "in_graph_list": in_graph_list,
+        "out_graph_list": out_graph_list,
+    }
+
+
     # Initialize framework
     model = KineticForecastingFramework(
         d_features=d_features,
         d_features_source=d_features_source,
         Q_mesoscale=Q_mesoscale,
         xi_velocities=xi_velocities,
-        spatial_conv_type='gaan',
-        conv_params={},
+        spatial_conv_type='diffconv',
+        conv_params=conv_params,
         collision_constraint='hard',
         dt=0.1,
         decay_steps=1000,
@@ -771,7 +781,7 @@ if __name__ == '__main__':
             print(f"Batch {batch_cnt}: Teacher forcing threshold = {threshold:.4f}")
         
         print("\nTesting forward pass in training mode...")
-        predictions, constraint_loss, reconstructions = model(
+        predictions, reconstructions = model(
             graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'), 
             num_pred_steps=num_pred_steps,
             target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
@@ -780,7 +790,6 @@ if __name__ == '__main__':
         
         print(f"Training forward pass successful!")
         print(f"Predictions shape: {predictions.shape}")
-        print(f"Constraint loss: {constraint_loss.item():.4f}")
         print(f"Reconstructions shape: {reconstructions.shape if reconstructions is not None else None}")
         
         # Check shapes
@@ -805,7 +814,7 @@ if __name__ == '__main__':
         # Reset hidden state
         model.source_hidden = None
         
-        predictions, constraint_loss, reconstructions = model(
+        predictions, reconstructions = model(
             graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
             num_pred_steps=num_pred_steps,
             target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),  # No targets in eval
@@ -814,12 +823,10 @@ if __name__ == '__main__':
         
         print(f"Evaluation forward pass successful!")
         print(f"Predictions shape: {predictions.shape}")
-        print(f"Constraint loss: {constraint_loss.item():.4f}")
         print(f"Reconstructions: {reconstructions}")  # Should be None
         
         # Check shapes
         assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
-        assert reconstructions is None, "Reconstructions should be None in eval mode"
         print("Evaluation mode shapes correct!")
         
     except Exception as e:
@@ -837,7 +844,7 @@ if __name__ == '__main__':
         # Test different prediction lengths
         for steps in [1, 3, 5]:
             model.source_hidden = None
-            predictions, _, reconstructions = model(
+            predictions, reconstructions = model(
                 graph, macro_sequence,
                 num_pred_steps=steps,
                 target_sequence=torch.randn(steps, N, d_features_source),
@@ -847,7 +854,7 @@ if __name__ == '__main__':
         
         # Test numerical stability
         model.source_hidden = None
-        predictions, constraint_loss, _ = model(
+        predictions, _ = model(
             graph, macro_sequence,
             num_pred_steps=10,  # Longer prediction
             target_sequence=torch.randn(10, N, d_features_source),
