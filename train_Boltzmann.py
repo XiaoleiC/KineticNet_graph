@@ -145,10 +145,10 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
             .to(device)
         )
         x = x.reshape(x.shape[0], -1, x.shape[3]).to(device)
-        y = y.reshape(x.shape[0], -1, x.shape[3]).to(device)
+        y = y.reshape(y.shape[0], -1, y.shape[3]).to(device)
 
         batch_graph = dgl.batch([graph] * batch_size)
-        output, y_reconstruct = model(graph = batch_graph, macro_features=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
+        output, y_reconstruct = model(graph = batch_graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
         y_pred = normalizer.denormalize(output)
 
         loss_predict = loss_fn(y_pred, y[...,:1])
@@ -288,6 +288,11 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
 
     loss_fn = masked_mae_loss
+    total_params = sum(p.numel() for p in dcrnn.parameters())
+    print(f"Total number of parameters: {total_params}")
+
+    trainable_params = sum(p.numel() for p in dcrnn.parameters() if p.requires_grad)
+    print(f"Trainable number of parameters: {trainable_params}")
 
     for e in range(args.epochs):
         train_loss_predict, train_loss_reconstruct = train(

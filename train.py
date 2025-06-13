@@ -156,7 +156,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="dcrnn",
+        default="gaan",
         help="WHich model to use DCRNN vs GaAN",
     )
     parser.add_argument(
@@ -264,6 +264,11 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
 
     loss_fn = masked_mae_loss
+    total_params = sum(p.numel() for p in dcrnn.parameters())
+    print(f"Total number of parameters: {total_params}")
+
+    trainable_params = sum(p.numel() for p in dcrnn.parameters() if p.requires_grad)
+    print(f"Trainable number of parameters: {trainable_params}")
 
     for e in range(args.epochs):
         train_loss = train(

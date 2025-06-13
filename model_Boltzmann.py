@@ -518,14 +518,14 @@ class KineticForecastingFramework(nn.Module):
             _, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
             
             # During training, also compute reconstruction for loss calculation
-            if self.training:
+            # if self.training:
                 # 1. Encode: macro → meso
-                f_current = self.macro_to_meso(graph, current_macro[...,:self.d_features])  # [N, Q]
-                
-                # 5. Decode: meso → macro
-                macro_reconstructed = self.meso_to_macro(f_current)  # [N, d]
-                
-                reconstruction_outputs.append(macro_reconstructed)
+            f_current = self.macro_to_meso(graph, current_macro[...,:self.d_features])  # [N, Q]
+            
+            # 5. Decode: meso → macro
+            macro_reconstructed = self.meso_to_macro(f_current)  # [N, d]
+            
+            reconstruction_outputs.append(macro_reconstructed)
         
         # Phase 2: Autoregressive prediction with adaptive teacher forcing
         current_macro = macro_features_sequence[-1]  # [N, d] - initial condition
@@ -564,11 +564,11 @@ class KineticForecastingFramework(nn.Module):
         # total_constraint_loss = torch.stack(constraint_losses).mean() if constraint_losses else torch.tensor(0.0)
         
         # Stack reconstruction outputs if in training mode
-        if self.training and reconstruction_outputs:
-            reconstruction_outputs = torch.stack(reconstruction_outputs, dim=0)  # [T, N, d]
-        else:
-            reconstruction_outputs = None
-        
+        # if self.training and reconstruction_outputs:
+        #     reconstruction_outputs = torch.stack(reconstruction_outputs, dim=0)  # [T, N, d]
+        # else:
+        #     reconstruction_outputs = None
+        reconstruction_outputs = torch.stack(reconstruction_outputs, dim=0)  # [T, N, d]
         return predictions, reconstruction_outputs
 
 
