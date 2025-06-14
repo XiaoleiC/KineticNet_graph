@@ -15,29 +15,44 @@ class MacroToMesoEncoder(nn.Module):
     Maps R^{N×d} → R^{N×Q}
     Incorporates spatial information using graph convolution.
     """
-    def __init__(self, d_features: int, Q_mesoscale: int, spatial_conv_type: str = 'diffconv', 
-                 conv_params: dict = None):
+    def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, spatial_conv_type: str = 'diffconv', 
+                 conv_params: dict = None, is_SGRNN: bool = False):
         super(MacroToMesoEncoder, self).__init__()
         self.d_features = d_features
         self.Q_mesoscale = Q_mesoscale
         self.spatial_conv_type = spatial_conv_type
-        
+        self.conv_layers = nn.ModuleList()
+        self.is_SGRNN = is_SGRNN
         # Choose spatial convolution method
         if spatial_conv_type == 'diffconv':
             # Parameters for DiffConv
             k = conv_params.get('k', 2) if conv_params else 2
             in_graph_list = conv_params.get('in_graph_list', [])
             out_graph_list = conv_params.get('out_graph_list', [])
-            self.spatial_conv = DiffConv(d_features, Q_mesoscale, k, 
-                                       in_graph_list, out_graph_list)
+            # self.spatial_conv = DiffConv(d_features, Q_mesoscale, k, 
+                                    #    in_graph_list, out_graph_list)
         elif spatial_conv_type == 'gaan':
             # Parameters for GatedGAT
             map_feats = conv_params.get('map_feats', 64) if conv_params else 64
             num_heads = conv_params.get('num_heads', 2) if conv_params else 2
-            self.spatial_conv = GatedGAT(d_features, Q_mesoscale, map_feats, num_heads)
+            # self.spatial_conv = GatedGAT(d_features, Q_mesoscale, map_feats, num_heads)
         else:
             raise ValueError(f"Unsupported spatial_conv_type: {spatial_conv_type}")
-    
+
+        for i in range(num_layers):
+            in_dim = d_features if i == 0 else Q_mesoscale
+            out_dim = Q_mesoscale
+            
+            # Choose spatial convolution method
+            if spatial_conv_type == 'diffconv':
+                conv_layer = DiffConv(in_dim, out_dim, k, in_graph_list, out_graph_list)
+            elif spatial_conv_type == 'gaan':
+                conv_layer = GatedGAT(in_dim, out_dim, map_feats, num_heads)
+            else:
+                raise ValueError(f"Unsupported spatial_conv_type: {spatial_conv_type}")
+            
+            self.conv_layers.append(conv_layer)
+
     def forward(self, graph, macro_features):
         """
         Args:
@@ -46,9 +61,14 @@ class MacroToMesoEncoder(nn.Module):
         Returns:
             meso_features: [N, Q] mesoscale distribution
         """
-        meso_features = self.spatial_conv(graph, macro_features)
-        meso_features = nn.functional.relu(meso_features)
-        return meso_features
+        x = macro_features
+        
+        # Apply multiple layers with ReLU activation
+        for _, conv_layer in enumerate(self.conv_layers):
+            x = conv_layer(graph, x)
+        if not self.is_SGRNN:
+            x = nn.functional.relu(x)  # Ensure output is non-negative
+        return x
 
 
 class CollisionOperator(nn.Module):
@@ -57,19 +77,24 @@ class CollisionOperator(nn.Module):
     Currently implemented as local (no inter-node correlations).
     """
     def __init__(self, Q_mesoscale: int, hidden_dim: int = 64, 
-                 constraint_type: str = 'none', xi_velocities: torch.Tensor = None):
+                 constraint_type: str = 'none', xi_velocities: torch.Tensor = None, num_layers: int = 5):
         super(CollisionOperator, self).__init__()
         self.Q_mesoscale = Q_mesoscale
         self.constraint_type = constraint_type  # 'none', 'soft', 'hard'
         
         # Simple MLP for collision operator
-        self.mlp = nn.Sequential(
-            nn.Linear(Q_mesoscale, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, Q_mesoscale)
-        )
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(Q_mesoscale, hidden_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_dim, Q_mesoscale)
+        # )
+        self.mlp = nn.ModuleList()
+        for k1 in range(num_layers):
+            in_dim = Q_mesoscale if k1 == 0 else hidden_dim
+            out_dim = hidden_dim if k1 < num_layers - 1 else Q_mesoscale
+            self.mlp.append(nn.Linear(in_dim, out_dim))
         
         # Store velocity discretization points ξ_k
         if xi_velocities is not None:
@@ -140,7 +165,11 @@ class CollisionOperator(nn.Module):
             omega: [N, Q] collision operator output
             constraint_loss: scalar (only for soft constraint)
         """
-        omega_raw = self.mlp(f_distribution)
+        x = f_distribution
+        for k2, layer in enumerate(self.mlp):
+            x = layer(x)
+            x = nn.functional.relu(x) if k2 < len(self.mlp) - 1 else nn.functional.tanh(x)
+        omega_raw = x
         
         if self.constraint_type == 'hard':
             omega = self._apply_hard_constraint(omega_raw)
@@ -160,16 +189,16 @@ class SGraphRNN(nn.Module):
     Purely data-driven module for modeling source term S(f).
     Similar to GraphRNN but operates entirely in Q-dimensional space.
     """
-    def __init__(self, d_features: int, Q_mesoscale: int, hidden_dim: int = 64,
-                 spatial_conv_type: str = 'gaan', conv_params: dict = None):
+    def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, hidden_dim: int = 64,
+                 spatial_conv_type: str = 'gaan', conv_params: dict = None, is_SGRNN: bool = True):
         super(SGraphRNN, self).__init__()
         self.d_features = d_features
         self.Q_mesoscale = Q_mesoscale
         self.hidden_dim = hidden_dim
         
         # Encoder: d → Q (with spatial information)
-        self.encoder = MacroToMesoEncoder(d_features, Q_mesoscale, 
-                                        spatial_conv_type, conv_params)
+        self.encoder = MacroToMesoEncoder(d_features, Q_mesoscale, num_layers,
+                                        spatial_conv_type, conv_params, is_SGRNN=is_SGRNN)
         
         # GRU for temporal evolution in Q-dimensional space
         self.gru_cell = nn.GRUCell(Q_mesoscale, hidden_dim)
@@ -429,9 +458,9 @@ class KineticForecastingFramework(nn.Module):
     Complete kinetic theory-informed forecasting framework.
     Integrates all five modules: Encoder → Updater ← (Collision + Source) → Decoder
     """
-    def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor,
+    def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor, num_layers_macro_to_meso: int = 1,
                  spatial_conv_type: str = 'diffconv', conv_params: dict = None,
-                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu'):
+                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
@@ -444,20 +473,20 @@ class KineticForecastingFramework(nn.Module):
             raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({xi_velocities.shape[0]})")
         
         # Module 1: MacroToMesoEncoder
-        self.macro_to_meso = MacroToMesoEncoder(d_features, Q_mesoscale,
-                                               spatial_conv_type, conv_params)
+        self.macro_to_meso = MacroToMesoEncoder(d_features=d_features, Q_mesoscale=Q_mesoscale, num_layers=num_layers_macro_to_meso,
+                                               spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False)
         
         # Module 2: BoltzmannUpdater  
         self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, xi_velocities, dt)
         
         # Module 3: SGraphRNN (for source term)
-        self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale,
+        self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale, num_layers = num_layers_macro_to_meso,
                                    spatial_conv_type=spatial_conv_type,
-                                   conv_params=conv_params)
+                                   conv_params=conv_params, is_SGRNN=True)
         
         # Module 4: CollisionOperator
         self.collision_op = CollisionOperator(Q_mesoscale, constraint_type=collision_constraint,
-                                            xi_velocities=xi_velocities)
+                                            xi_velocities=xi_velocities, num_layers=num_layers_collision)
         
         # Module 5: MesoToMacroDecoder
         self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, d_features, xi_velocities)

@@ -101,7 +101,7 @@ def train(
         predict_loss.append(float(loss_predict))
         batch_cnt[0] += 1
         # print("\rBatch: ", i, end="")
-        print(f"\rBatch: {i} Predict Loss: {loss_predict:.4f} Reconstruct Loss: {loss_reconstruct:.4f}", end="")
+        print(f"\rBatch: {i} Predict Loss: {loss_predict} Reconstruct Loss: {loss_reconstruct}", end="")
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="diffconv",
-        help="WHich model to use DCRNN vs GaAN",
+        help="Which model to use DCRNN vs GaAN",
     )
     parser.add_argument(
         "--gpu", type=int, default=0, help="GPU indexm -1 for CPU training"
@@ -203,7 +203,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--minimum_lr",
         type=float,
-        default=2e-6,
+        default=1e-6,
         help="Lower bound of learning rate",
     )
     parser.add_argument(
@@ -259,7 +259,7 @@ if __name__ == "__main__":
     )
     normalizer = NormalizationLayer(train_data.mean, train_data.std)
 
-    if args.model == "dcrnn":
+    if args.model == "diffconv":
         batch_g = dgl.batch([g] * args.batch_size).to(device)
         out_gs, in_gs = DiffConv.attach_graph(batch_g, args.diffsteps)
         net = partial(
@@ -282,18 +282,23 @@ if __name__ == "__main__":
         "out_graph_list": out_graph_list,
     }
     
-    xi_num = 32
+    xi_num = 16
+    num_macro_to_meso_layers = 1
+    num_layers_collision = 8
+
     dcrnn = GraphRNN(
         d_features=1,
         d_features_source=2,
         Q_mesoscale=xi_num,
         xi_velocities=torch.linspace(0,1,xi_num).to(device),
+        num_layers_macro_to_meso=num_macro_to_meso_layers,
         spatial_conv_type=args.model,
         conv_params=conv_params,
         collision_constraint='hard',
         dt=5/60,
         decay_steps=args.decay_steps,
-        device=device
+        device=device,
+        num_layers_collision=num_layers_collision
     ).to(device)
 
     optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)
