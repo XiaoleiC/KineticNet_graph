@@ -101,7 +101,7 @@ def train(
         predict_loss.append(float(loss_predict))
         batch_cnt[0] += 1
         # print("\rBatch: ", i, end="")
-        print(f"\rBatch: {i} Predict Loss: {loss_predict} Reconstruct Loss: {loss_reconstruct}", end="")
+        print(f"\rBatch: {i} Predict Loss: {loss_predict:.4f} Reconstruct Loss: {loss_reconstruct:.4f}", end="")
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
@@ -282,7 +282,7 @@ if __name__ == "__main__":
         "out_graph_list": out_graph_list,
     }
     
-    xi_num = 16
+    xi_num = 12
     num_macro_to_meso_layers = 1
     num_layers_collision = 8
 

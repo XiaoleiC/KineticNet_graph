@@ -453,6 +453,7 @@ class MesoToMacroDecoder(nn.Module):
         return macro_output
 
 
+
 class KineticForecastingFramework(nn.Module):
     """
     Complete kinetic theory-informed forecasting framework.
@@ -468,6 +469,7 @@ class KineticForecastingFramework(nn.Module):
         self.Q_mesoscale = Q_mesoscale
         self.decay_steps = decay_steps  # For teacher forcing decay
         self.device = device if isinstance(device, torch.device) else torch.device(device)
+        self.register_buffer('xi_velocities', xi_velocities)  # [Q]
 
         if Q_mesoscale != xi_velocities.shape[0]:
             raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({xi_velocities.shape[0]})")
@@ -477,7 +479,7 @@ class KineticForecastingFramework(nn.Module):
                                                spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False)
         
         # Module 2: BoltzmannUpdater  
-        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, xi_velocities, dt)
+        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, self.xi_velocities, dt)
         
         # Module 3: SGraphRNN (for source term)
         self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale, num_layers = num_layers_macro_to_meso,
@@ -486,10 +488,10 @@ class KineticForecastingFramework(nn.Module):
         
         # Module 4: CollisionOperator
         self.collision_op = CollisionOperator(Q_mesoscale, constraint_type=collision_constraint,
-                                            xi_velocities=xi_velocities, num_layers=num_layers_collision)
+                                            xi_velocities=self.xi_velocities, num_layers=num_layers_collision)
         
         # Module 5: MesoToMacroDecoder
-        self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, d_features, xi_velocities)
+        self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, d_features, self.xi_velocities)
         self.source_hidden = None  # Hidden state for source term RNN
 
     def compute_teacher_forcing_threshold(self, batch_cnt):
