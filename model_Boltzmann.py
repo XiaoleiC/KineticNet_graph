@@ -66,6 +66,7 @@ class MacroToMesoEncoder(nn.Module):
         # Apply multiple layers with ReLU activation
         for _, conv_layer in enumerate(self.conv_layers):
             x = conv_layer(graph, x)
+            x = nn.functional.tanh(x)
         if not self.is_SGRNN:
             x = nn.functional.relu(x)  # Ensure output is non-negative
         return x

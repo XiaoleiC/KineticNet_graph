@@ -1,9 +1,3 @@
-"""
-pretrain_macro_to_meso.py
-
-预训练 MacroToMesoEncoder → MesoToMacroDecoder 以实现自监督重构
-python pretrain_macro_to_meso.py --dataset LA --epochs 20
-"""
 import argparse
 from functools import partial
 
@@ -13,22 +7,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 
-# ===== 项目内依赖 =====
-from dataloading import (          # :contentReference[oaicite:0]{index=0}
+from dataloading import (
     METR_LAGraphDataset, METR_LATrainDataset, METR_LAValidDataset,
     PEMS_BAYGraphDataset, PEMS_BAYTrainDataset, PEMS_BAYValidDataset
 )
-from dcrnn import DiffConv          # :contentReference[oaicite:1]{index=1}
-from model_Boltzmann import (       # :contentReference[oaicite:2]{index=2}
+from dcrnn import DiffConv
+from model_Boltzmann import (
     MacroToMesoEncoder, MesoToMacroDecoder
 )
-from utils import NormalizationLayer, masked_mae_loss  # :contentReference[oaicite:3]{index=3}
+from utils import NormalizationLayer, masked_mae_loss
 
-# ------------------ 1. 预训练包装 ------------------
 class MacroToMesoPretrainer(nn.Module):
-    """
-    Macro → Meso Encoder + 轻量 Decoder 做自监督重构
-    """
     def __init__(self,
                  d_features: int,
                  Q_mesoscale: int,
@@ -37,8 +26,6 @@ class MacroToMesoPretrainer(nn.Module):
                  spatial_conv_type: str,
                  conv_params: dict):
         super().__init__()
-
-        self.register_buffer('xi_velocities', xi_velocities)
 
         self.encoder = MacroToMesoEncoder(
             d_features=d_features,
@@ -51,38 +38,47 @@ class MacroToMesoPretrainer(nn.Module):
         self.decoder = MesoToMacroDecoder(
             Q_mesoscale=Q_mesoscale,
             d_features=d_features,
-            xi_velocities=self.xi_velocities
+            xi_velocities=xi_velocities
         )
 
     def forward(self, g, macro_x):
-        """
-        macro_x: [T, N, d]  这里只用 d=1 的速度
-        """
         T, N, _ = macro_x.shape
         recon_seq = []
         for t in range(T):
             f_t = self.encoder(g, macro_x[t,:,:1])
-            recon_t = self.decoder(f_t)          # 仅输出速度 [N,1]
+            recon_t = self.decoder(f_t)
             recon_seq.append(recon_t)
-        return torch.stack(recon_seq, dim=0)            # [T,N,1]
+        return torch.stack(recon_seq, dim=0)
 
-# ------------------ 2. 训练入口 ------------------
+
 def train_one_epoch(model, graph, loader,
                     normalizer, loss_fn,
                     optimizer, device):
     model.train()
     epoch_loss = []
     graph = graph.to(device)
-    for x, _ in loader:               # 这里只需要 x
-        # shape: [B, seq, N, d]  →  [seq, B*N, d]
-        x = x.permute(1, 0, 2, 3)                 # [T,B,N,d]
-        x = x.reshape(x.shape[0], -1, x.shape[3]) # [T,B*N,d]
+    batch_graph = dgl.batch([graph] * loader.batch_size).to(device)
+    for x, _ in loader:
+        if x.shape[0] != loader.batch_size:
+            x_buff = torch.zeros(loader.batch_size, x.shape[1], x.shape[2], x.shape[3])
+            x_buff[: x.shape[0], :, :, :] = x
+            x_buff[x.shape[0] :, :, :, :] = x[-1].repeat(
+                loader.batch_size - x.shape[0], 1, 1, 1
+            )
+            x = x_buff
 
-        x_norm = normalizer.normalize(x).float().to(device)
+        x = x.permute(1, 0, 2, 3)
+
+        x_norm = (
+            normalizer.normalize(x)
+            .reshape(x.shape[0], -1, x.shape[3])
+            .float()
+            .to(device)
+        )
 
         optimizer.zero_grad()
-        recon = model(graph, x_norm)              # [T,BN,1]
-        x_tgt = x_norm[..., :1]                   # 只对速度做重构
+        recon = model(batch_graph, x_norm)
+        x_tgt = x_norm[..., :1]
 
         loss = loss_fn(recon, x_tgt)
         loss.backward()
@@ -98,27 +94,39 @@ def evaluate(model, graph, loader,
     model.eval()
     graph = graph.to(device)
     epoch_loss = []
+    batch_graph = dgl.batch([graph] * loader.batch_size).to(device)
     for x, _ in loader:
-        x = x.permute(1, 0, 2, 3).reshape(x.shape[1], -1, x.shape[3])
-        x_norm = normalizer.normalize(x)[...,:1].float().to(device)
-        recon = model(graph, x_norm)
+        if x.shape[0] != loader.batch_size:
+            x_buff = torch.zeros(loader.batch_size, x.shape[1], x.shape[2], x.shape[3])
+            x_buff[: x.shape[0], :, :, :] = x
+            x_buff[x.shape[0] :, :, :, :] = x[-1].repeat(
+                loader.batch_size - x.shape[0], 1, 1, 1
+            )
+            x = x_buff
+
+        x = x.permute(1, 0, 2, 3)
+        x_norm = (
+            normalizer.normalize(x)
+            .reshape(x.shape[0], -1, x.shape[3])
+            .float()
+            .to(device)
+        )
+
+        recon = model(batch_graph, x_norm)
         loss = loss_fn(recon, x_norm[..., :1])
         epoch_loss.append(float(loss))
     return np.mean(epoch_loss)
 
-
-# ------------------ 3. main ------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='LA', choices=['LA', 'BAY'])
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--diffsteps', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--gpu', type=int, default=0)
     args = parser.parse_args()
 
-    # 3.1 数据集与图
     if args.dataset == 'LA':
         g_raw = METR_LAGraphDataset()
         train_ds, val_ds = METR_LATrainDataset(), METR_LAValidDataset()
@@ -132,31 +140,27 @@ def main():
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     normalizer = NormalizationLayer(train_ds.mean, train_ds.std)
 
-    # 3.2 预计算 DiffConv 图
     batch_g = dgl.batch([g_raw] * args.batch_size).to(device)
     out_gs, in_gs = DiffConv.attach_graph(batch_g, args.diffsteps)
     conv_params = dict(k=args.diffsteps,
                        in_graph_list=in_gs,
                        out_graph_list=out_gs)
 
-    # 3.3 模型
-    Q = 12                                  # 可自定义
-    xi = torch.linspace(0, 1, Q).to(device) # 正速度网格
+    Q = 12
+    xi = torch.linspace(-1, 1, Q).to(device)
     model = MacroToMesoPretrainer(
-        d_features=1,                       # 这里只预训练速度
+        d_features=1,
         Q_mesoscale=Q,
         xi_velocities=xi,
         encoder_layers=1,
-        spatial_conv_type='diffconv',       # 或 'gaan'
+        spatial_conv_type='diffconv',
         conv_params=conv_params
     ).to(device)
 
-    # 3.4 优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5, gamma=0.5)
-    loss_fn = masked_mae_loss               # MAE 更鲁棒
+    loss_fn = masked_mae_loss
 
-    # 3.5 训练
     best_val = float('inf')
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(model, batch_g, train_loader,
@@ -169,7 +173,7 @@ def main():
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.encoder.state_dict(), 'encoder_state_dict.pth')
-            print('  ✓ Saved best encoder_state_dict.pth')
+            print('Saved best encoder_state_dict.pth')
 
     print('Finished pretraining!')
 
