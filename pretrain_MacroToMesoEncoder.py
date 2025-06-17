@@ -83,6 +83,8 @@ def train_one_epoch(model, graph, loader,
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         epoch_loss.append(float(loss))
+    print(f'target: {x_norm[:,0,0]}')
+    print(f'recon: {recon[:,0,0]}')
     return np.mean(epoch_loss)
 
 
@@ -112,6 +114,8 @@ def evaluate(model, graph, loader,
         recon = model(graph.to(device), x_norm)
         loss = loss_fn(recon, x_norm[..., :1])
         epoch_loss.append(float(loss))
+    print(f'target: {x_norm[:,0,0]}')
+    print(f'recon: {recon[:,0,0]}')
     return np.mean(epoch_loss)
 
 def main():
@@ -143,8 +147,8 @@ def main():
                        in_graph_list=in_gs,
                        out_graph_list=out_gs)
 
-    Q = 20
-    xi = torch.linspace(max(train_ds.mean-2*train_ds.std, 0), train_ds.mean+2*train_ds.std, Q).to(device)
+    Q = 30
+    xi = torch.linspace(max(train_ds.mean-3*train_ds.std, 0), train_ds.mean+3*train_ds.std, Q).to(device)
     model = MacroToMesoPretrainer(
         d_features=1,
         Q_mesoscale=Q,
