@@ -412,24 +412,25 @@ class MesoToMacroDecoder(nn.Module):
         # For now, use equal weights (UQ methods can be added later)
         self.register_buffer('weights', torch.ones(Q_mesoscale) / Q_mesoscale)  # [Q]
     
-    def forward(self, f_distribution):
+    def forward(self, f_distribution, macro_velocities):
         """
         Compute macroscale moments from mesoscale distribution.
         
         Args:
             f_distribution: [N, Q] mesoscale distribution
+            macro_velocities: [N, 1] macroscale velocities (used for shifting)
         Returns:
             macro_variables: [N, d] macroscale variables
         """
         N = f_distribution.shape[0]
         macro_variables = []
-        
+        xi_shifted = self.xi_velocities.unsqueeze(0) + macro_velocities
         # 0th moment: density ρ = ∫f dξ
         density = torch.sum(f_distribution * self.weights, dim=1, keepdim=True)  # [N, 1]
         macro_variables.append(density)
         
         # 1st moment: velocity u = ∫ξf dξ / ρ  
-        momentum = torch.sum(f_distribution * self.weights * self.xi_velocities, dim=1, keepdim=True)  # [N, 1]
+        momentum = torch.sum(f_distribution * self.weights.unsqueeze(0) * xi_shifted, dim=1, keepdim=True)  # [N, 1]
         velocity = momentum / (density + 1e-8)  # Avoid division by zero
         macro_variables.append(velocity)
         
