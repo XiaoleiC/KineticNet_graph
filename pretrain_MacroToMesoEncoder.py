@@ -47,7 +47,7 @@ class MacroToMesoPretrainer(nn.Module):
         for t in range(T):
             f_t = self.encoder(g, macro_x[t,:,:1])
             recon_t = self.decoder(f_t)
-            recon_seq.append(recon_t)
+            recon_seq.append(recon_t) 
         return torch.stack(recon_seq, dim=0)
 
 
@@ -56,8 +56,6 @@ def train_one_epoch(model, graph, loader,
                     optimizer, device):
     model.train()
     epoch_loss = []
-    graph = graph.to(device)
-    batch_graph = dgl.batch([graph] * loader.batch_size).to(device)
     for x, _ in loader:
         if x.shape[0] != loader.batch_size:
             x_buff = torch.zeros(loader.batch_size, x.shape[1], x.shape[2], x.shape[3])
@@ -68,16 +66,16 @@ def train_one_epoch(model, graph, loader,
             x = x_buff
 
         x = x.permute(1, 0, 2, 3)
-
-        x_norm = (
-            normalizer.normalize(x)
-            .reshape(x.shape[0], -1, x.shape[3])
-            .float()
-            .to(device)
-        )
+        x_norm = x.reshape(x.shape[0], -1, x.shape[3]).float().to(device)
+        # x_norm = (
+        #     normalizer.normalize(x)
+        #     .reshape(x.shape[0], -1, x.shape[3])
+        #     .float()
+        #     .to(device)
+        # )
 
         optimizer.zero_grad()
-        recon = model(batch_graph, x_norm)
+        recon = model(graph.to(device), x_norm)
         x_tgt = x_norm[..., :1]
 
         loss = loss_fn(recon, x_tgt)
@@ -92,9 +90,7 @@ def train_one_epoch(model, graph, loader,
 def evaluate(model, graph, loader,
              normalizer, loss_fn, device):
     model.eval()
-    graph = graph.to(device)
     epoch_loss = []
-    batch_graph = dgl.batch([graph] * loader.batch_size).to(device)
     for x, _ in loader:
         if x.shape[0] != loader.batch_size:
             x_buff = torch.zeros(loader.batch_size, x.shape[1], x.shape[2], x.shape[3])
@@ -105,14 +101,15 @@ def evaluate(model, graph, loader,
             x = x_buff
 
         x = x.permute(1, 0, 2, 3)
-        x_norm = (
-            normalizer.normalize(x)
-            .reshape(x.shape[0], -1, x.shape[3])
-            .float()
-            .to(device)
-        )
+        x_norm = x.reshape(x.shape[0], -1, x.shape[3]).float().to(device)
+        # x_norm = (
+        #     normalizer.normalize(x)
+        #     .reshape(x.shape[0], -1, x.shape[3])
+        #     .float()
+        #     .to(device)
+        # )
 
-        recon = model(batch_graph, x_norm)
+        recon = model(graph.to(device), x_norm)
         loss = loss_fn(recon, x_norm[..., :1])
         epoch_loss.append(float(loss))
     return np.mean(epoch_loss)
@@ -146,14 +143,14 @@ def main():
                        in_graph_list=in_gs,
                        out_graph_list=out_gs)
 
-    Q = 12
-    xi = torch.linspace(-1, 1, Q).to(device)
+    Q = 20
+    xi = torch.linspace(max(train_ds.mean-2*train_ds.std, 0), train_ds.mean+2*train_ds.std, Q).to(device)
     model = MacroToMesoPretrainer(
         d_features=1,
         Q_mesoscale=Q,
         xi_velocities=xi,
         encoder_layers=1,
-        spatial_conv_type='diffconv',
+        spatial_conv_type='gaan',
         conv_params=conv_params
     ).to(device)
 
@@ -169,7 +166,7 @@ def main():
                             normalizer, loss_fn, device)
         scheduler.step()
 
-        print(f'Epoch {epoch:03d}: train {tr_loss:.4f}  val {val_loss:.4f}')
+        print(f'Epoch {epoch}: train {tr_loss:.4f}  val {val_loss:.4f}')
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.encoder.state_dict(), 'encoder_state_dict.pth')

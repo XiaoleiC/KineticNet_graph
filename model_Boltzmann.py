@@ -26,15 +26,15 @@ class MacroToMesoEncoder(nn.Module):
         # Choose spatial convolution method
         if spatial_conv_type == 'diffconv':
             # Parameters for DiffConv
-            k = conv_params.get('k', 2) if conv_params else 2
+            k = conv_params.get('k', 2)
             in_graph_list = conv_params.get('in_graph_list', [])
             out_graph_list = conv_params.get('out_graph_list', [])
             # self.spatial_conv = DiffConv(d_features, Q_mesoscale, k, 
                                     #    in_graph_list, out_graph_list)
         elif spatial_conv_type == 'gaan':
             # Parameters for GatedGAT
-            map_feats = conv_params.get('map_feats', 64) if conv_params else 64
-            num_heads = conv_params.get('num_heads', 2) if conv_params else 2
+            map_feats = conv_params.get('map_feats', 64)
+            num_heads = conv_params.get('num_heads', 2)
             # self.spatial_conv = GatedGAT(d_features, Q_mesoscale, map_feats, num_heads)
         else:
             raise ValueError(f"Unsupported spatial_conv_type: {spatial_conv_type}")
@@ -64,9 +64,9 @@ class MacroToMesoEncoder(nn.Module):
         x = macro_features
         
         # Apply multiple layers with ReLU activation
-        for _, conv_layer in enumerate(self.conv_layers):
+        for i, conv_layer in enumerate(self.conv_layers):
             x = conv_layer(graph, x)
-            x = nn.functional.tanh(x)
+            x = nn.functional.tanh(x) if i < len(self.conv_layers) - 1 else x
         if not self.is_SGRNN:
             x = nn.functional.relu(x)  # Ensure output is non-negative
         return x
