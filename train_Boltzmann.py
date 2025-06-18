@@ -176,7 +176,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="diffconv",
+        default="gaan",
         help="Which model to use DCRNN vs GaAN",
     )
     parser.add_argument(

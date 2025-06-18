@@ -98,74 +98,88 @@ class CollisionOperator(nn.Module):
             self.mlp.append(nn.Linear(in_dim, out_dim))
         
         # Store velocity discretization points ξ_k
-        if xi_velocities is not None:
-            self.register_buffer('xi_velocities', xi_velocities)  # [Q]
-            # Compute collision invariance matrix C
-            self.register_buffer('C_matrix', self._compute_C_matrix())
-        else:
-            self.xi_velocities = None
-            self.C_matrix = None
+        self.register_buffer('xi_velocities', xi_velocities)  # [Q]
     
-    def _compute_C_matrix(self):
+    def _compute_C_matrix(self, macro_velocities):
         """
         Compute collision invariance matrix C for constraints:
         - Mass conservation: ∫ Ω(f) dξ = 0
         - Momentum conservation: ∫ ξ Ω(f) dξ = 0  
-        - Energy conservation: ∫ ξ² Ω(f) dξ = 0
+        
+        Args:
+            macro_velocities: [N, 1] macro velocities for each node
+        Returns:
+            C: [N, 2, Q] collision invariance matrix for each node
         """
         Q = self.Q_mesoscale
-        # Assume equal weights w_i = 1/Q for now
-        w = torch.ones(Q) / Q
-        w = w.to(self.xi_velocities.device)
-        C = torch.zeros(2, Q)
-        C[0, :] = w  # Mass conservation
-        C[1, :] = w * self.xi_velocities  # Momentum conservation
-        # C[2, :] = 0.5 * w * self.xi_velocities**2  # Energy conservation
+        N = macro_velocities.shape[0]
+        
+        # xi_shifted: [N, Q] - absolute velocities for each node
+        xi_shifted = self.xi_velocities.unsqueeze(0) + macro_velocities  # [N, Q]
+        
+        # Equal weights
+        w = torch.ones(Q, device=self.xi_velocities.device) / Q
+        
+        C = torch.zeros(N, 2, Q, device=self.xi_velocities.device)
+        C[:, 0, :] = w.unsqueeze(0)  # Mass conservation: [N, Q]
+        C[:, 1, :] = w.unsqueeze(0) * xi_shifted  # Momentum conservation: [N, Q]
         
         return C
+
     
-    def _apply_hard_constraint(self, omega_raw):
+    def _apply_hard_constraint(self, omega_raw, C_matrix):
         """
-        Apply hard collision invariance constraint using Lagrangian method.
+        Apply hard collision invariance constraint using Lagrangian method (batched version).
         Ω* = (I - C^T(CC^T)^{-1}C) Ω
+        
+        Args:
+            omega_raw: [N, Q] raw collision operator output
+            C_matrix: [N, 2, Q] collision invariance matrix for each node
+        Returns:
+            omega_constrained: [N, Q] constrained collision operator output
         """
-        if self.C_matrix is None:
-            return omega_raw
+        N, Q = omega_raw.shape
+        device = omega_raw.device
         
-        C = self.C_matrix  # [3, Q]
-        I = torch.eye(self.Q_mesoscale, device=omega_raw.device)
+        # Identity matrix
+        I = torch.eye(Q, device=device).unsqueeze(0).expand(N, -1, -1)  # [N, Q, Q]
         
-        # Compute projection matrix
-        CCT_inv = torch.inverse(C @ C.T + 1e-6 * torch.eye(2, device=omega_raw.device))
-        projection = I - C.T @ CCT_inv @ C
+        # Compute CC^T for all nodes: [N, 2, Q] @ [N, Q, 2] = [N, 2, 2]
+        CCT = torch.bmm(C_matrix, C_matrix.transpose(-1, -2))  # [N, 2, 2]
         
-        # Apply projection to each node
-        omega_constrained = omega_raw @ projection.T
+        # Add regularization
+        reg = 1e-6 * torch.eye(2, device=device).unsqueeze(0).expand(N, -1, -1)
+        CCT = CCT + reg  # [N, 2, 2]
+        
+        # Compute (CC^T)^{-1} for all nodes
+        CCT_inv = torch.inverse(CCT)  # [N, 2, 2]
+        
+        # Compute C^T(CC^T)^{-1}C for all nodes
+        # C_matrix.transpose(-1, -2): [N, Q, 2]
+        # CCT_inv: [N, 2, 2] 
+        # C_matrix: [N, 2, Q]
+        temp = torch.bmm(C_matrix.transpose(-1, -2), CCT_inv)  # [N, Q, 2]
+        CTC_inv_C = torch.bmm(temp, C_matrix)  # [N, Q, Q]
+        
+        # Compute projection matrix: I - C^T(CC^T)^{-1}C
+        projection = I - CTC_inv_C  # [N, Q, Q]
+        
+        # Apply projection: omega_raw @ projection^T
+        # omega_raw.unsqueeze(-1): [N, Q, 1]
+        # projection.transpose(-1, -2): [N, Q, Q]
+        omega_constrained = torch.bmm(projection, omega_raw.unsqueeze(-1)).squeeze(-1)  # [N, Q]
         
         return omega_constrained
     
-    def compute_soft_constraint_loss(self, omega):
-        """
-        Compute soft constraint loss for collision invariance.
-        """
-        if self.C_matrix is None:
-            return torch.tensor(0.0, device=omega.device)
-        
-        # omega: [N, Q]
-        # C: [3, Q]
-        constraint_violations = torch.matmul(omega, self.C_matrix.T)  # [N, 3]
-        loss = torch.mean(constraint_violations**2)
-        
-        return loss
-    
-    def forward(self, f_distribution):
+    def forward(self, f_distribution, macro_velocities):
         """
         Args:
             f_distribution: [N, Q] mesoscale distribution
+            macro_velocities: [N,1] macro velocities for each node
         Returns:
             omega: [N, Q] collision operator output
-            constraint_loss: scalar (only for soft constraint)
         """
+        # MLP forward pass
         x = f_distribution
         for k2, layer in enumerate(self.mlp):
             x = layer(x)
@@ -173,14 +187,11 @@ class CollisionOperator(nn.Module):
         omega_raw = x
         
         if self.constraint_type == 'hard':
-            omega = self._apply_hard_constraint(omega_raw)
-            # constraint_loss = torch.tensor(0.0, device=f_distribution.device)
-        elif self.constraint_type == 'soft':
-            omega = omega_raw
-            # constraint_loss = self.compute_soft_constraint_loss(omega)
+            # Compute C matrix for current macro velocities
+            C_matrix = self._compute_C_matrix(macro_velocities)  # [N, 2, Q]
+            omega = self._apply_hard_constraint(omega_raw, C_matrix)
         else:  # 'none'
             omega = omega_raw
-            # constraint_loss = torch.tensor(0.0, device=f_distribution.device)
         
         return omega
 
@@ -462,7 +473,7 @@ class KineticForecastingFramework(nn.Module):
     Integrates all five modules: Encoder → Updater ← (Collision + Source) → Decoder
     """
     def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor, num_layers_macro_to_meso: int = 1,
-                 spatial_conv_type: str = 'diffconv', conv_params: dict = None,
+                 spatial_conv_type: str = 'gaan', conv_params: dict = None,
                  collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6):
         super(KineticForecastingFramework, self).__init__()
         
@@ -535,7 +546,7 @@ class KineticForecastingFramework(nn.Module):
         """        
         T = macro_features_sequence.shape[0]
         macro_features_sequence = macro_features_sequence.to(self.device)
-        target_sequence = target_sequence.to(self.device) if target_sequence is not None else None
+        target_sequence = target_sequence.to(self.device)
         predictions = []
         # constraint_losses = []
         reconstruction_outputs = []  # For training phase reconstruction loss
@@ -548,33 +559,38 @@ class KineticForecastingFramework(nn.Module):
             current_macro = macro_features_sequence[t]  # [N, d]
             
             # Update source term hidden states with ground truth data
-            _, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
+            source_term, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
             
             # During training, also compute reconstruction for loss calculation
             # if self.training:
                 # 1. Encode: macro → meso
-            f_current = self.macro_to_meso(graph, current_macro[...,:self.d_features])  # [N, Q]
+            f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
             
             # 5. Decode: meso → macro
-            macro_reconstructed = self.meso_to_macro(f_current)  # [N, d]
+            macro_reconstructed = self.meso_to_macro(f_current, current_macro[...,:1])  # [N, d]
             
             reconstruction_outputs.append(macro_reconstructed)
         
+        collision_term = self.collision_op(f_current)
+        f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
+        macro_next = self.meso_to_macro(f_next, current_macro[...,:1])  # [N, d]
         # Phase 2: Autoregressive prediction with adaptive teacher forcing
-        current_macro = macro_features_sequence[-1]  # [N, d] - initial condition
+        predictions.append(macro_next)
 
-        for step in range(num_pred_steps):
+        for step in range(num_pred_steps-1):
             # 1. Encode: macro → meso (spatial correlations only)
-            f_current = self.macro_to_meso(graph, current_macro[...,:self.d_features])  # [N, Q]
+            # f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
             
             # 2. Adaptive teacher forcing decision for source term input
             if (self.training and target_sequence is not None and 
                 np.random.random() < teacher_forcing_threshold):
                 # Use ground truth for source term (teacher forcing)
+                f_current = self.macro_to_meso(graph, target_sequence[step]) # [N, Q]
                 source_input = target_sequence[step]  # [N, d]
             else:
                 # Use model prediction for source term
-                source_input = current_macro  # [N, d]
+                f_current = f_next
+                source_input = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # [N, d]
             # 3. Compute source term (carries historical memory)
             source_term, self.source_hidden = self.source_rnn(graph, source_input, 
                                                               self.source_hidden)
@@ -587,10 +603,10 @@ class KineticForecastingFramework(nn.Module):
             f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
             
             # 6. Decode: meso → macro
-            macro_next = self.meso_to_macro(f_next)  # [N, d]
+            macro_next = self.meso_to_macro(f_next, macro_next)  # [N, d]
             
             predictions.append(macro_next)
-            current_macro = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # Update for next iteration??
+            # current_macro = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # Update for next iteration??
             
         self.source_hidden = None  # Reset source hidden state after prediction
         predictions = torch.stack(predictions, dim=0)  # [num_pred_steps, N, d]
