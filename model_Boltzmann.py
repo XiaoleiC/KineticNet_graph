@@ -260,18 +260,16 @@ class BoltzmannUpdater(nn.Module):
         self.Q_mesoscale = Q_mesoscale
         self.dt = dt
         
-        # Register velocity discretization
-        self.register_buffer('xi_velocities', xi_velocities)  # [Q]
-        
         # Learnable flow weights q_ij (initialized uniformly)
         # Note: These will be computed based on graph structure
     
-    def compute_transport_term(self, graph, f_distribution):
+    def compute_transport_term(self, graph, f_distribution, xi_velocities_per_node):
         # graph = graph.clone()
         graph = dgl.remove_self_loop(graph)  # Remove self-loops for transport computation
         with graph.local_scope():
             # Store distribution on nodes
             graph.ndata['f'] = f_distribution  # [N, Q]
+            graph.ndata['xi'] = xi_velocities_per_node  # [N, Q]
             reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
 
             graph.ndata['out_degree'] = graph.out_degrees().float()  # [N]
@@ -279,44 +277,87 @@ class BoltzmannUpdater(nn.Module):
             reverse_graph.ndata['out_degree'] = reverse_graph.out_degrees().float()
             reverse_graph.ndata['in_degree'] = reverse_graph.in_degrees().float()
             
-            # Precompute velocity matrix for broadcasting: [Q] -> [1, Q]
-            xi_broadcast = self.xi_velocities.unsqueeze(0)  # [1, Q]
-            
-            # Inflow computation (vectorized over all velocity components)
             def message_func_inflow(edges):
-                # f_diff: [E, Q] - differences for all velocity components
-                f_diff = edges.dst['f'] - edges.src['f']  # [E, Q]
+                # Get source and destination distributions and velocities
+                f_src = edges.src['f']  # [E, Q]
+                f_dst = edges.dst['f']  # [E, Q]
+                xi_src = edges.src['xi']  # [E, Q]
+                xi_dst = edges.dst['xi']  # [E, Q]
                 
-                # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
-                edge_weight = edges.data.get('weight', torch.ones(edges.src['f'].shape[0], device=f_diff.device))
-                edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
+                E, Q = f_src.shape
                 
-                q_ij = (1.0 / edges.src['out_degree']).unsqueeze(1)  # [E, 1], !!! The problem is that we assume the weight is the same for all particle velocities
+                # Vectorized velocity matching using broadcasting
+                # xi_src: [E, Q, 1] vs xi_dst: [E, 1, Q] -> [E, Q, Q]
+                xi_src_expanded = xi_src.unsqueeze(2)  # [E, Q, 1]
+                xi_dst_expanded = xi_dst.unsqueeze(1)  # [E, 1, Q]
                 
-                # Broadcast xi_velocities: [1, Q] -> [E, Q]
-                xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, Q]
+                # Compute pairwise velocity differences: [E, Q, Q]
+                xi_diff = torch.abs(xi_src_expanded - xi_dst_expanded)
+                velocity_matches = xi_diff < 0.1  # [E, Q, Q] - matches[e, q_src, q_dst]
                 
-                # Compute transport for all velocity components: [E, Q]
-                transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, Q]
+                # Expand f distributions for broadcasting
+                f_src_expanded = f_src.unsqueeze(2)  # [E, Q, 1]
+                f_dst_expanded = f_dst.unsqueeze(1)  # [E, 1, Q]
+                
+                # Compute f differences for all src-dst velocity pairs: [E, Q, Q]
+                f_diff = (f_dst_expanded - f_src_expanded) * velocity_matches.float()
+                
+                # Edge weights and flow probability
+                edge_weight = edges.data['weight']  # [E]
+                q_ij = 1.0 / torch.clamp(edges.src['out_degree'], min=1.0)  # [E]
+                
+                # Expand for broadcasting: [E, 1, 1]
+                edge_weight = edge_weight.unsqueeze(1).unsqueeze(2)
+                q_ij = q_ij.unsqueeze(1).unsqueeze(2)
+                xi_src_for_transport = xi_src_expanded  # [E, Q, 1]
+                
+                # Compute transport contributions: [E, Q, Q]
+                transport_matrix = q_ij * xi_src_for_transport * f_diff * edge_weight
+                
+                # Sum over destination velocities to get transport for each source velocity: [E, Q]
+                transport = torch.sum(transport_matrix, dim=2)
                 
                 return {'transport_all': transport}
             
-            # Outflow computation (vectorized over all velocity components)  
             def message_func_outflow(edges):
-                # f_diff: [E, Q] - differences for all velocity components
-                f_diff = edges.src['f'] - edges.dst['f']  # [E, Q]
+                # Get source and destination distributions and velocities
+                f_src = edges.src['f']  # [E, Q]
+                f_dst = edges.dst['f']  # [E, Q]
+                xi_src = edges.src['xi']  # [E, Q]
+                xi_dst = edges.dst['xi']  # [E, Q]
                 
-                # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
-                edge_weight = edges.data.get('weight', torch.ones(edges.src['f'].shape[0], device=f_diff.device))
-                edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
+                E, Q = f_src.shape
                 
-                q_ij = (1.0 / edges.dst['in_degree']).unsqueeze(1)  # [E, 1]
+                # Vectorized velocity matching using broadcasting
+                # xi_src: [E, Q, 1] vs xi_dst: [E, 1, Q] -> [E, Q, Q]
+                xi_src_expanded = xi_src.unsqueeze(2)  # [E, Q, 1]
+                xi_dst_expanded = xi_dst.unsqueeze(1)  # [E, 1, Q]
                 
-                # Broadcast xi_velocities: [1, Q] -> [E, Q]
-                xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, Q]
+                # Compute pairwise velocity differences: [E, Q, Q]
+                xi_diff = torch.abs(xi_src_expanded - xi_dst_expanded)
+                velocity_matches = xi_diff < 0.1  # [E, Q, Q] - matches[e, q_src, q_dst]
                 
-                # Compute transport for all velocity components: [E, Q]
-                transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, Q]
+                # Expand f distributions for broadcasting
+                f_src_expanded = f_src.unsqueeze(2)  # [E, Q, 1]
+                f_dst_expanded = f_dst.unsqueeze(1)  # [E, 1, Q]
+                
+                # Compute f differences for all src-dst velocity pairs: [E, Q, Q]
+                f_diff = (f_src_expanded - f_dst_expanded) * velocity_matches.float()
+                
+                # Edge weights and flow probability
+                edge_weight = edges.data['weight']  # [E]
+                q_ij = 1.0 / torch.clamp(edges.dst['in_degree'], min=1.0)  # [E]
+                
+                # Expand for broadcasting: [E, 1, 1]
+                edge_weight = edge_weight.unsqueeze(1).unsqueeze(2)
+                q_ij = q_ij.unsqueeze(1).unsqueeze(2)
+                xi_src_for_transport = xi_src_expanded  # [E, Q, 1]
+                
+                # Compute transport contributions: [E, Q, Q]
+                transport_matrix = q_ij * xi_src_for_transport * f_diff * edge_weight
+                
+                # Sum over destination velocities to get transport for each source velocity: [E, Q]
+                transport = torch.sum(transport_matrix, dim=2)
                 
                 return {'transport_all': transport}
             
@@ -339,7 +380,7 @@ class BoltzmannUpdater(nn.Module):
             
         return transport_term
     
-    def forward(self, graph, f_distribution, collision_term, source_term):
+    def forward(self, graph, f_distribution, xi_velocities_per_node, collision_term, source_term):
         """
         Update distribution using Boltzmann equation.
         
@@ -353,7 +394,7 @@ class BoltzmannUpdater(nn.Module):
         """
         f_distribution = torch.clamp(f_distribution, min=0.0)
         # Compute transport term
-        transport_term = self.compute_transport_term(graph, f_distribution)
+        transport_term = self.compute_transport_term(graph, f_distribution, xi_velocities_per_node)
         
         # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
         f_new = f_distribution - self.dt * (transport_term - collision_term - source_term)
