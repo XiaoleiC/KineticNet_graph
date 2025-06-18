@@ -12,10 +12,10 @@ from functools import partial
 class MacroToMesoEncoder(nn.Module):
     """
     Encoder that lifts macroscale variables to mesoscale.
-    Maps [N, d] to [N, Q] mesoscale distribution. But in this version, it is to [N, 75]
+    Maps R^{N×d} → R^{N×Q}
     Incorporates spatial information using graph convolution.
     """
-    def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, spatial_conv_type: str = 'diffconv', 
+    def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, spatial_conv_type: str = 'gaan', 
                  conv_params: dict = None, is_SGRNN: bool = False):
         super(MacroToMesoEncoder, self).__init__()
         self.d_features = d_features
@@ -75,7 +75,7 @@ class MacroToMesoEncoder(nn.Module):
 class CollisionOperator(nn.Module):
     """
     Collision operator Ω(f) with collision invariance constraints.
-    Currently implemented as local (no inter-node correlations).
+    Currently implemented as local (no inter-node interactions).
     """
     def __init__(self, Q_mesoscale: int, hidden_dim: int = 64, 
                  constraint_type: str = 'none', xi_velocities: torch.Tensor = None, num_layers: int = 5):
@@ -255,21 +255,59 @@ class BoltzmannUpdater(nn.Module):
     Physical update module based on discretized Boltzmann equation.
     Implements: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
     """
-    def __init__(self, Q_mesoscale: int, xi_velocities: torch.Tensor, dt: float = 0.1):
+    def __init__(self, Q_mesoscale: int, dt: float = 0.1, min_macrovelocity: int = 0, max_macrovelocity: int = 75, xi_velocity_per_node: torch.Tensor = None):
         super(BoltzmannUpdater, self).__init__()
         self.Q_mesoscale = Q_mesoscale
         self.dt = dt
+
+        if max_macrovelocity is not None and min_macrovelocity is not None and xi_velocity_per_node is not None:
+            self.min_macrovelocity = min_macrovelocity
+            self.max_macrovelocity = max_macrovelocity
+            self.unified_size = max_macrovelocity - min_macrovelocity + 1
+            
+            # Register per-node velocity values
+            self.register_buffer('xi_velocity_per_node', xi_velocity_per_node)  # [N, Q_mesoscale]
+        else:
+            self.unified_size = Q_mesoscale
+            self.min_macrovelocity = None
+            self.max_macrovelocity = None
         
         # Learnable flow weights q_ij (initialized uniformly)
         # Note: These will be computed based on graph structure
+
+    def convert_to_unified(self, f_local):
+        """
+        Convert local velocity distribution to unified range.
+        
+        Args:
+            f_local: [N, Q_mesoscale] local distributions
+        Returns:
+            f_unified: [N, unified_size] unified distributions
+        """
+            
+        N = f_local.shape[0]
+        device = f_local.device
+        
+        # Create unified tensor filled with zeros
+        f_unified = torch.zeros(N, self.unified_size, device=device, dtype=f_local.dtype)
+        
+        # Fill in the values for each node
+        for node_idx in range(N):
+            node_velocities = self.xi_velocity_per_node[node_idx].long()  # [Q_mesoscale]
+            
+            for local_idx, global_vel in enumerate(node_velocities):
+                if self.min_macrovelocity <= global_vel <= self.max_macrovelocity:
+                    unified_idx = global_vel - self.min_macrovelocity
+                    f_unified[node_idx, unified_idx] = f_local[node_idx, local_idx]
+        
+        return f_unified  # [N, unified_size]
     
-    def compute_transport_term(self, graph, f_distribution, xi_velocities_per_node):
+    def compute_transport_term(self, graph, f_distribution):
         # graph = graph.clone()
         graph = dgl.remove_self_loop(graph)  # Remove self-loops for transport computation
         with graph.local_scope():
             # Store distribution on nodes
-            graph.ndata['f'] = f_distribution  # [N, Q]
-            graph.ndata['xi'] = xi_velocities_per_node  # [N, Q]
+            graph.ndata['f'] = f_distribution  # [N, unified_size]
             reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
 
             graph.ndata['out_degree'] = graph.out_degrees().float()  # [N]
@@ -277,94 +315,48 @@ class BoltzmannUpdater(nn.Module):
             reverse_graph.ndata['out_degree'] = reverse_graph.out_degrees().float()
             reverse_graph.ndata['in_degree'] = reverse_graph.in_degrees().float()
             
+            xi_unified = torch.arange(self.min_macrovelocity, self.max_macrovelocity + 1, device=f_distribution.device)  # [unified_size]
+            xi_broadcast = xi_unified.unsqueeze(0)  # [1, unified_size]
+            
+            # Inflow computation (vectorized over all velocity components)
             def message_func_inflow(edges):
-                # Get source and destination distributions and velocities
-                f_src = edges.src['f']  # [E, Q]
-                f_dst = edges.dst['f']  # [E, Q]
-                xi_src = edges.src['xi']  # [E, Q]
-                xi_dst = edges.dst['xi']  # [E, Q]
+                f_diff = edges.dst['f'] - edges.src['f']  # [E, unified_size]
                 
-                E, Q = f_src.shape
+                # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
+                edge_weight = edges.data['weight']
+                edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
                 
-                # Vectorized velocity matching using broadcasting
-                # xi_src: [E, Q, 1] vs xi_dst: [E, 1, Q] -> [E, Q, Q]
-                xi_src_expanded = xi_src.unsqueeze(2)  # [E, Q, 1]
-                xi_dst_expanded = xi_dst.unsqueeze(1)  # [E, 1, Q]
+                q_ij = (1.0 / edges.src['out_degree']).unsqueeze(1)  # [E, 1], !!! The problem is that we assume the weight is the same for all particle velocities
                 
-                # Compute pairwise velocity differences: [E, Q, Q]
-                xi_diff = torch.abs(xi_src_expanded - xi_dst_expanded)
-                velocity_matches = xi_diff < 0.1  # [E, Q, Q] - matches[e, q_src, q_dst]
+                # Broadcast xi_velocities: [1, Q] -> [E, Q]
+                xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, unified_size]
                 
-                # Expand f distributions for broadcasting
-                f_src_expanded = f_src.unsqueeze(2)  # [E, Q, 1]
-                f_dst_expanded = f_dst.unsqueeze(1)  # [E, 1, Q]
-                
-                # Compute f differences for all src-dst velocity pairs: [E, Q, Q]
-                f_diff = (f_dst_expanded - f_src_expanded) * velocity_matches.float()
-                
-                # Edge weights and flow probability
-                edge_weight = edges.data['weight']  # [E]
-                q_ij = 1.0 / torch.clamp(edges.src['out_degree'], min=1.0)  # [E]
-                
-                # Expand for broadcasting: [E, 1, 1]
-                edge_weight = edge_weight.unsqueeze(1).unsqueeze(2)
-                q_ij = q_ij.unsqueeze(1).unsqueeze(2)
-                xi_src_for_transport = xi_src_expanded  # [E, Q, 1]
-                
-                # Compute transport contributions: [E, Q, Q]
-                transport_matrix = q_ij * xi_src_for_transport * f_diff * edge_weight
-                
-                # Sum over destination velocities to get transport for each source velocity: [E, Q]
-                transport = torch.sum(transport_matrix, dim=2)
+                # Compute transport for all velocity components: [E, Q]
+                transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, Q]
                 
                 return {'transport_all': transport}
             
+            # Outflow computation (vectorized over all velocity components)  
             def message_func_outflow(edges):
-                # Get source and destination distributions and velocities
-                f_src = edges.src['f']  # [E, Q]
-                f_dst = edges.dst['f']  # [E, Q]
-                xi_src = edges.src['xi']  # [E, Q]
-                xi_dst = edges.dst['xi']  # [E, Q]
+                # f_diff: [E, Q] - differences for all velocity components
+                f_diff = edges.src['f'] - edges.dst['f']  # [E, unified_size]
                 
-                E, Q = f_src.shape
+                # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
+                edge_weight = edges.data['weight']
+                edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
                 
-                # Vectorized velocity matching using broadcasting
-                # xi_src: [E, Q, 1] vs xi_dst: [E, 1, Q] -> [E, Q, Q]
-                xi_src_expanded = xi_src.unsqueeze(2)  # [E, Q, 1]
-                xi_dst_expanded = xi_dst.unsqueeze(1)  # [E, 1, Q]
+                q_ij = (1.0 / edges.dst['in_degree']).unsqueeze(1)  # [E, 1]
                 
-                # Compute pairwise velocity differences: [E, Q, Q]
-                xi_diff = torch.abs(xi_src_expanded - xi_dst_expanded)
-                velocity_matches = xi_diff < 0.1  # [E, Q, Q] - matches[e, q_src, q_dst]
+                # Broadcast xi_velocities: [1, Q] -> [E, Q]
+                xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, unified_size]
                 
-                # Expand f distributions for broadcasting
-                f_src_expanded = f_src.unsqueeze(2)  # [E, Q, 1]
-                f_dst_expanded = f_dst.unsqueeze(1)  # [E, 1, Q]
-                
-                # Compute f differences for all src-dst velocity pairs: [E, Q, Q]
-                f_diff = (f_src_expanded - f_dst_expanded) * velocity_matches.float()
-                
-                # Edge weights and flow probability
-                edge_weight = edges.data['weight']  # [E]
-                q_ij = 1.0 / torch.clamp(edges.dst['in_degree'], min=1.0)  # [E]
-                
-                # Expand for broadcasting: [E, 1, 1]
-                edge_weight = edge_weight.unsqueeze(1).unsqueeze(2)
-                q_ij = q_ij.unsqueeze(1).unsqueeze(2)
-                xi_src_for_transport = xi_src_expanded  # [E, Q, 1]
-                
-                # Compute transport contributions: [E, Q, Q]
-                transport_matrix = q_ij * xi_src_for_transport * f_diff * edge_weight
-                
-                # Sum over destination velocities to get transport for each source velocity: [E, Q]
-                transport = torch.sum(transport_matrix, dim=2)
+                # Compute transport for all velocity components: [E, unified_size]
+                transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, unified_size]
                 
                 return {'transport_all': transport}
             
             # Reduce function: sum over neighbors for all velocity components
             def reduce_func(nodes):
-                # nodes.mailbox['transport_all']: [N, max_degree, Q]
-                # Sum over neighbors (dim=1): [N, Q]
                 return {'transport_sum_all': torch.sum(nodes.mailbox['transport_all'], dim=1)}
             
             # Single message passing for inflow (all velocity components)
@@ -380,7 +372,7 @@ class BoltzmannUpdater(nn.Module):
             
         return transport_term
     
-    def forward(self, graph, f_distribution, xi_velocities_per_node, collision_term, source_term):
+    def forward(self, graph, f_distribution_local, collision_term_local, source_term_local):
         """
         Update distribution using Boltzmann equation.
         
@@ -392,9 +384,12 @@ class BoltzmannUpdater(nn.Module):
         Returns:
             f_new: [N, Q] updated distribution
         """
-        f_distribution = torch.clamp(f_distribution, min=0.0)
+        f_distribution_local = torch.clamp(f_distribution_local, min=0.0)
+        f_distribution = self.convert_to_unified(f_distribution_local)  # Convert to unified range
+        collision_term = self.convert_to_unified(collision_term_local)  # Convert collision term to unified range
+        source_term = self.convert_to_unified(source_term_local)  # Convert source term to unified range
         # Compute transport term
-        transport_term = self.compute_transport_term(graph, f_distribution, xi_velocities_per_node)
+        transport_term = self.compute_transport_term(graph, f_distribution)
         
         # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
         f_new = f_distribution - self.dt * (transport_term - collision_term - source_term)
