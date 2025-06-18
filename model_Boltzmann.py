@@ -115,7 +115,7 @@ class CollisionOperator(nn.Module):
         N = macro_velocities.shape[0]
         
         # xi_shifted: [N, Q] - absolute velocities for each node
-        xi_shifted = self.xi_velocities.unsqueeze(0) + macro_velocities  # [N, Q]
+        xi_shifted = self.xi_velocities.unsqueeze(0) + torch.round(macro_velocities)  # [N, Q]
         
         # Equal weights
         w = torch.ones(Q, device=self.xi_velocities.device) / Q
@@ -124,7 +124,7 @@ class CollisionOperator(nn.Module):
         C[:, 0, :] = w.unsqueeze(0)  # Mass conservation: [N, Q]
         C[:, 1, :] = w.unsqueeze(0) * xi_shifted  # Momentum conservation: [N, Q]
         
-        return C
+        return C, xi_shifted
 
     
     def _apply_hard_constraint(self, omega_raw, C_matrix):
@@ -188,12 +188,12 @@ class CollisionOperator(nn.Module):
         
         if self.constraint_type == 'hard':
             # Compute C matrix for current macro velocities
-            C_matrix = self._compute_C_matrix(macro_velocities)  # [N, 2, Q]
+            C_matrix, x_shifted = self._compute_C_matrix(macro_velocities)  # [N, 2, Q]
             omega = self._apply_hard_constraint(omega_raw, C_matrix)
         else:  # 'none'
             omega = omega_raw
         
-        return omega
+        return omega, x_shifted
 
 
 class SGraphRNN(nn.Module):
@@ -268,7 +268,7 @@ class BoltzmannUpdater(nn.Module):
     
     def compute_transport_term(self, graph, f_distribution):
         # graph = graph.clone()
-        # graph = dgl.remove_self_loop(graph)  # Remove self-loops for transport computation
+        graph = dgl.remove_self_loop(graph)  # Remove self-loops for transport computation
         with graph.local_scope():
             # Store distribution on nodes
             graph.ndata['f'] = f_distribution  # [N, Q]
@@ -336,52 +336,6 @@ class BoltzmannUpdater(nn.Module):
             
             # Final transport term: [N, Q]
             transport_term = outflow - inflow
-        
-        # for-loop
-        # with graph.local_scope():
-        #     # Store distribution on nodes
-        #     graph.ndata['f'] = f_distribution  # [N, Q]
-        #     reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
-        #     # Compute differences for each velocity component
-        #     transport_terms = []
-            
-        #     for k in range(self.Q_mesoscale):
-        #         xi_k = self.xi_velocities[k]
-                
-        #         # Message function: compute ξ_k * (f_j - f_i) / d_ij for each edge
-        #         def message_func_inflow(edges):
-        #             f_diff = edges.dst['f'][:, k] - edges.src['f'][:, k]  # [E]
-        #             # Use edge weight as 1/d_ij, and assume q_ij is uniform for now
-        #             edge_weight = edges.data.get('weight', torch.ones_like(f_diff))
-        #             q_ij = 1.0 / edges.src['out_degree']  # Approximate uniform distribution
-                    
-        #             transport = q_ij * xi_k * f_diff * edge_weight
-        #             return {'transport_k': transport}
-                
-        #         def message_func_outflow(edges):
-        #             f_diff = edges.src['f'][:, k] - edges.dst['f'][:, k]  # [E]
-        #             # Use edge weight as 1/d_ij, and assume q_ij is uniform for now
-        #             edge_weight = edges.data.get('weight', torch.ones_like(f_diff))
-        #             q_ij = 1.0 / edges.dst['in_degree']  # Approximate uniform distribution
-                    
-        #             transport = q_ij * xi_k * f_diff * edge_weight
-        #             return {'transport_k': transport}
-                
-        #         # Reduce function: sum over neighbors
-        #         def reduce_func(nodes):
-        #             return {'transport_sum_k': torch.sum(nodes.mailbox['transport_k'], dim=1)}
-                
-        #         graph.update_all(message_func_inflow, reduce_func)
-        #         inflow = graph.ndata['transport_sum_k'].clone()
-
-        #         reverse_graph.update_all(message_func_outflow, reduce_func)
-        #         outflow = reverse_graph.ndata['transport_sum_k'].clone()
-
-        #         # Apply message passing for this velocity component
-        #         transport_terms.append(outflow - inflow)  
-            
-        #     # Stack transport terms: [N, Q]
-        #     transport_term = torch.stack(transport_terms, dim=1)
             
         return transport_term
     
