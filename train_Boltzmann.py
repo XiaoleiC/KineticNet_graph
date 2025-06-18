@@ -228,11 +228,23 @@ if __name__ == "__main__":
         train_data = METR_LATrainDataset()
         test_data = METR_LATestDataset()
         valid_data = METR_LAValidDataset()
+        print(f'Min and max of the training data X: {train_data.x.min()}, {train_data.x.max()}')
+        print(f'Min and max of the training data Y: {train_data.y.min()}, {train_data.y.max()}')
+        print(f'Min and max of the test data X: {test_data.x.min()}, {test_data.x.max()}')
+        print(f'Min and max of the test data Y: {test_data.y.min()}, {test_data.y.max()}')
+        print(f'Min and max of the validation data X: {valid_data.x.min()}, {valid_data.x.max()}')
+        print(f'Min and max of the validation data Y: {valid_data.y.min()}, {valid_data.y.max()}')
     elif args.dataset == "BAY":
         g = PEMS_BAYGraphDataset()
         train_data = PEMS_BAYTrainDataset()
         test_data = PEMS_BAYTestDataset()
         valid_data = PEMS_BAYValidDataset()
+        print(f'Min and max of the training data X: {train_data.x.min()}, {train_data.x.max()}')
+        print(f'Min and max of the training data Y: {train_data.y.min()}, {train_data.y.max()}')
+        print(f'Min and max of the test data X: {test_data.x.min()}, {test_data.x.max()}')
+        print(f'Min and max of the test data Y: {test_data.y.min()}, {test_data.y.max()}')
+        print(f'Min and max of the validation data X: {valid_data.x.min()}, {valid_data.x.max()}')
+        print(f'Min and max of the validation data Y: {valid_data.y.min()}, {valid_data.y.max()}')
 
     if args.gpu == -1:
         device = torch.device("cpu")

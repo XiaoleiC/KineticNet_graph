@@ -12,7 +12,7 @@ from functools import partial
 class MacroToMesoEncoder(nn.Module):
     """
     Encoder that lifts macroscale variables to mesoscale.
-    Maps R^{N×d} → R^{N×Q}
+    Maps [N, d] to [N, Q] mesoscale distribution. But in this version, it is to [N, 75]
     Incorporates spatial information using graph convolution.
     """
     def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, spatial_conv_type: str = 'diffconv', 
