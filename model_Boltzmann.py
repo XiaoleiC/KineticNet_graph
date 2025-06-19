@@ -7,7 +7,7 @@ from typing import Optional, Union
 from dcrnn import DiffConv
 from gaan import GatedGAT
 from functools import partial
-
+import time
 
 class MacroToMesoEncoder(nn.Module):
     """
@@ -124,7 +124,7 @@ class CollisionOperator(nn.Module):
         C[:, 0, :] = w.unsqueeze(0)  # Mass conservation: [N, Q]
         C[:, 1, :] = w.unsqueeze(0) * xi_shifted  # Momentum conservation: [N, Q]
         
-        return C, xi_shifted
+        return C
 
     
     def _apply_hard_constraint(self, omega_raw, C_matrix):
@@ -188,12 +188,12 @@ class CollisionOperator(nn.Module):
         
         if self.constraint_type == 'hard':
             # Compute C matrix for current macro velocities
-            C_matrix, x_shifted = self._compute_C_matrix(macro_velocities)  # [N, 2, Q]
+            C_matrix = self._compute_C_matrix(macro_velocities)  # [N, 2, Q]
             omega = self._apply_hard_constraint(omega_raw, C_matrix)
         else:  # 'none'
             omega = omega_raw
         
-        return omega, x_shifted
+        return omega
 
 
 class SGraphRNN(nn.Module):
@@ -251,56 +251,33 @@ class SGraphRNN(nn.Module):
 
 
 class BoltzmannUpdater(nn.Module):
-    """
-    Physical update module based on discretized Boltzmann equation.
-    Implements: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
-    """
-    def __init__(self, Q_mesoscale: int, dt: float = 0.1, min_macrovelocity: int = 0, max_macrovelocity: int = 75, xi_velocity_per_node: torch.Tensor = None):
+    def __init__(self, Q_mesoscale: int, dt: float = 0.1, min_macrovelocity: int = 0, max_macrovelocity: int = 75, base_graph = None):
         super(BoltzmannUpdater, self).__init__()
         self.Q_mesoscale = Q_mesoscale
         self.dt = dt
+        self.min_macrovelocity = min_macrovelocity
+        self.max_macrovelocity = max_macrovelocity
+        self.unified_size = max_macrovelocity - min_macrovelocity + 1
+        
+            
+    def convert_to_local(self, f_unified, xi_per_node):
+        offsets = (xi_per_node - self.min_macrovelocity).long()
+        mask    = (offsets >= 0) & (offsets < self.unified_size)
+        row_idx = torch.arange(f_unified.size(0), device=f_unified.device).unsqueeze(1)
+        f_local = torch.zeros(f_unified.size(0), self.Q_mesoscale, device=f_unified.device,
+                            dtype=f_unified.dtype)
+        f_local[mask] = f_unified[row_idx.expand_as(offsets)[mask], offsets[mask]]
+        return f_local         
 
-        if max_macrovelocity is not None and min_macrovelocity is not None and xi_velocity_per_node is not None:
-            self.min_macrovelocity = min_macrovelocity
-            self.max_macrovelocity = max_macrovelocity
-            self.unified_size = max_macrovelocity - min_macrovelocity + 1
-            
-            # Register per-node velocity values
-            self.register_buffer('xi_velocity_per_node', xi_velocity_per_node)  # [N, Q_mesoscale]
-        else:
-            self.unified_size = Q_mesoscale
-            self.min_macrovelocity = None
-            self.max_macrovelocity = None
-        
-        # Learnable flow weights q_ij (initialized uniformly)
-        # Note: These will be computed based on graph structure
-
-    def convert_to_unified(self, f_local):
-        """
-        Convert local velocity distribution to unified range.
-        
-        Args:
-            f_local: [N, Q_mesoscale] local distributions
-        Returns:
-            f_unified: [N, unified_size] unified distributions
-        """
-            
-        N = f_local.shape[0]
-        device = f_local.device
-        
-        # Create unified tensor filled with zeros
-        f_unified = torch.zeros(N, self.unified_size, device=device, dtype=f_local.dtype)
-        
-        # Fill in the values for each node
-        for node_idx in range(N):
-            node_velocities = self.xi_velocity_per_node[node_idx].long()  # [Q_mesoscale]
-            
-            for local_idx, global_vel in enumerate(node_velocities):
-                if self.min_macrovelocity <= global_vel <= self.max_macrovelocity:
-                    unified_idx = global_vel - self.min_macrovelocity
-                    f_unified[node_idx, unified_idx] = f_local[node_idx, local_idx]
-        
-        return f_unified  # [N, unified_size]
+    def convert_to_unified(self, f_local, xi_per_node):
+        # f_local: [N,Q]   xi_per_node: [N,Q]
+        offsets = (xi_per_node - self.min_macrovelocity).long()        # [N,Q]
+        mask    = (offsets >= 0) & (offsets < self.unified_size)       # bool
+        row_idx = torch.arange(f_local.size(0), device=f_local.device).unsqueeze(1)
+        f_uni   = torch.zeros(f_local.size(0), self.unified_size, device=f_local.device,
+                            dtype=f_local.dtype)
+        f_uni[row_idx.expand_as(offsets)[mask], offsets[mask]] = f_local[mask]
+        return f_uni
     
     def compute_transport_term(self, graph, f_distribution):
         # graph = graph.clone()
@@ -372,7 +349,7 @@ class BoltzmannUpdater(nn.Module):
             
         return transport_term
     
-    def forward(self, graph, f_distribution_local, collision_term_local, source_term_local):
+    def forward(self, graph, f_distribution_local, xi_velocity_per_node, collision_term_local, source_term_local):
         """
         Update distribution using Boltzmann equation.
         
@@ -385,9 +362,9 @@ class BoltzmannUpdater(nn.Module):
             f_new: [N, Q] updated distribution
         """
         f_distribution_local = torch.clamp(f_distribution_local, min=0.0)
-        f_distribution = self.convert_to_unified(f_distribution_local)  # Convert to unified range
-        collision_term = self.convert_to_unified(collision_term_local)  # Convert collision term to unified range
-        source_term = self.convert_to_unified(source_term_local)  # Convert source term to unified range
+        f_distribution = self.convert_to_unified(f_distribution_local, xi_velocity_per_node)  # Convert to unified range
+        collision_term = self.convert_to_unified(collision_term_local, xi_velocity_per_node)  # Convert collision term to unified range
+        source_term = self.convert_to_unified(source_term_local, xi_velocity_per_node)  # Convert source term to unified range
         # Compute transport term
         transport_term = self.compute_transport_term(graph, f_distribution)
         
@@ -399,58 +376,25 @@ class BoltzmannUpdater(nn.Module):
 
 
 class MesoToMacroDecoder(nn.Module):
-    """
-    Explicit decoder that converts mesoscale distribution to macroscale variables.
-    Implements moment calculation: ρ = ∫f dξ, u = ∫ξf dξ/ρ, etc.
-    """
-    def __init__(self, Q_mesoscale: int, d_features: int, xi_velocities: torch.Tensor):
+    def __init__(self, Q_mesoscale: int, xi_velocities: torch.Tensor):
         super(MesoToMacroDecoder, self).__init__()
         self.Q_mesoscale = Q_mesoscale
-        self.d_features = d_features
         
         # Register velocity discretization and weights
-        self.register_buffer('xi_velocities', xi_velocities)  # [Q]
+        self.register_buffer('xi_velocities', xi_velocities)  # [unified_size]
         # For now, use equal weights (UQ methods can be added later)
-        self.register_buffer('weights', torch.ones(Q_mesoscale) / Q_mesoscale)  # [Q]
+        self.register_buffer('weights', torch.ones(Q_mesoscale) / Q_mesoscale)  # [unified_size]
     
-    def forward(self, f_distribution, macro_velocities):
-        """
-        Compute macroscale moments from mesoscale distribution.
-        
-        Args:
-            f_distribution: [N, Q] mesoscale distribution
-            macro_velocities: [N, 1] macroscale velocities (used for shifting)
-        Returns:
-            macro_variables: [N, d] macroscale variables
-        """
+    def forward(self, f_distribution):
         N = f_distribution.shape[0]
         macro_variables = []
-        xi_shifted = self.xi_velocities.unsqueeze(0) + macro_velocities
-        # 0th moment: density ρ = ∫f dξ
+        xi_broadcast = self.xi_velocities.unsqueeze(0)
         density = torch.sum(f_distribution * self.weights, dim=1, keepdim=True)  # [N, 1]
         macro_variables.append(density)
         
-        # 1st moment: velocity u = ∫ξf dξ / ρ  
-        momentum = torch.sum(f_distribution * self.weights.unsqueeze(0) * xi_shifted, dim=1, keepdim=True)  # [N, 1]
+        momentum = torch.sum(f_distribution * self.weights.unsqueeze(0) * xi_broadcast, dim=1, keepdim=True)  # [N, 1]
         velocity = momentum / (density + 1e-8)  # Avoid division by zero
         macro_variables.append(velocity)
-        
-        # # Higher moments can be added based on d_features
-        # if self.d_features > 2:
-        #     # 2nd moment: energy/temperature related
-        #     energy = torch.sum(f_distribution * self.weights * self.xi_velocities**2, dim=1, keepdim=True)
-        #     macro_variables.append(energy)
-        
-        # # Add more moments as needed to match d_features
-        # while len(macro_variables) < self.d_features:
-        #     # Add higher order moments or other derived quantities
-        #     moment_order = len(macro_variables)
-        #     higher_moment = torch.sum(f_distribution * self.weights * (self.xi_velocities**moment_order), 
-        #                             dim=1, keepdim=True)
-        #     macro_variables.append(higher_moment)
-        
-        # # Concatenate and select first d_features
-        # macro_output = torch.cat(macro_variables[:self.d_features], dim=1)  # [N, d]
         macro_output = macro_variables[1] # [N, 1], only the velocity is used for now
         
         return macro_output
@@ -458,11 +402,7 @@ class MesoToMacroDecoder(nn.Module):
 
 
 class KineticForecastingFramework(nn.Module):
-    """
-    Complete kinetic theory-informed forecasting framework.
-    Integrates all five modules: Encoder → Updater ← (Collision + Source) → Decoder
-    """
-    def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor, num_layers_macro_to_meso: int = 1,
+    def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor, min_macrovelocity=0, max_macrovelocity=70, num_layers_macro_to_meso: int = 1,
                  spatial_conv_type: str = 'gaan', conv_params: dict = None,
                  collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6):
         super(KineticForecastingFramework, self).__init__()
@@ -473,6 +413,7 @@ class KineticForecastingFramework(nn.Module):
         self.decay_steps = decay_steps  # For teacher forcing decay
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.register_buffer('xi_velocities', xi_velocities)  # [Q]
+        self.unified_size = max_macrovelocity - min_macrovelocity + 1
 
         if Q_mesoscale != xi_velocities.shape[0]:
             raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({xi_velocities.shape[0]})")
@@ -480,12 +421,12 @@ class KineticForecastingFramework(nn.Module):
         # Module 1: MacroToMesoEncoder
         self.macro_to_meso = MacroToMesoEncoder(d_features=d_features, Q_mesoscale=Q_mesoscale, num_layers=num_layers_macro_to_meso,
                                                spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False)
-        
+         
         # Module 2: BoltzmannUpdater  
-        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, self.xi_velocities, dt)
+        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, dt, min_macrovelocity=min_macrovelocity, max_macrovelocity=max_macrovelocity)
         
         # Module 3: SGraphRNN (for source term)
-        self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale, num_layers = num_layers_macro_to_meso,
+        self.source_rnn = SGraphRNN(d_features_source, self.unified_size, num_layers = num_layers_macro_to_meso,
                                    spatial_conv_type=spatial_conv_type,
                                    conv_params=conv_params, is_SGRNN=True)
         
@@ -494,7 +435,7 @@ class KineticForecastingFramework(nn.Module):
                                             xi_velocities=self.xi_velocities, num_layers=num_layers_collision)
         
         # Module 5: MesoToMacroDecoder
-        self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, d_features, self.xi_velocities)
+        self.meso_to_macro = MesoToMacroDecoder(self.unified_size, torch.linspace(min_macrovelocity, max_macrovelocity, self.unified_size, device=self.device))
         self.source_hidden = None  # Hidden state for source term RNN
 
     def compute_teacher_forcing_threshold(self, batch_cnt):
@@ -507,9 +448,8 @@ class KineticForecastingFramework(nn.Module):
         Returns:
             threshold: probability of using teacher forcing [0, 1]
         """
-        import numpy as np
         return self.decay_steps / (
-            self.decay_steps + np.exp(batch_cnt / self.decay_steps)
+            self.decay_steps + np.exp(batch_cnt / self.decay_steps) 
         )
 
     def forward(self, graph, macro_features_sequence, num_pred_steps: int = 1, 
@@ -534,6 +474,7 @@ class KineticForecastingFramework(nn.Module):
             constraint_losses: collision invariance losses
             reconstruction_outputs: [T, N, d] reconstructed historical sequence (training only)
         """        
+        time0 = time.time()
         T = macro_features_sequence.shape[0]
         macro_features_sequence = macro_features_sequence.to(self.device)
         target_sequence = target_sequence.to(self.device)
@@ -547,53 +488,55 @@ class KineticForecastingFramework(nn.Module):
         # Phase 1: Historical sequence processing with reconstruction (training phase)
         for t in range(T):
             current_macro = macro_features_sequence[t]  # [N, d]
-            
+            xi_shifted = self.xi_velocities.unsqueeze(0) + torch.round(current_macro[...,:1])
             # Update source term hidden states with ground truth data
             source_term, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
             
             # During training, also compute reconstruction for loss calculation
             # if self.training:
                 # 1. Encode: macro → meso
-            f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
-            
+            f_current_local = self.macro_to_meso(graph, current_macro)  # [N, Q]
+            f_current_full = self.boltzmann_updater.convert_to_unified(f_current_local, xi_shifted)  # Convert to unified range
             # 5. Decode: meso → macro
-            macro_reconstructed = self.meso_to_macro(f_current, current_macro[...,:1])  # [N, d]
+            macro_reconstructed = self.meso_to_macro(f_current_full)  # [N, 1]
             
             reconstruction_outputs.append(macro_reconstructed)
         
-        collision_term = self.collision_op(f_current)
-        f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
-        macro_next = self.meso_to_macro(f_next, current_macro[...,:1])  # [N, d]
+        collision_term = self.collision_op(f_current_local,current_macro[...,:1])
+        f_next_full = self.boltzmann_updater(graph, f_current_local, xi_shifted, collision_term, source_term)
+        macro_next = self.meso_to_macro(f_next_full)  # [N, 1]
         # Phase 2: Autoregressive prediction with adaptive teacher forcing
         predictions.append(macro_next)
 
         for step in range(num_pred_steps-1):
             # 1. Encode: macro → meso (spatial correlations only)
             # f_current = self.macro_to_meso(graph, current_macro)  # [N, Q]
-            
             # 2. Adaptive teacher forcing decision for source term input
             if (self.training and target_sequence is not None and 
                 np.random.random() < teacher_forcing_threshold):
                 # Use ground truth for source term (teacher forcing)
-                f_current = self.macro_to_meso(graph, target_sequence[step]) # [N, Q]
+                f_current_local = self.macro_to_meso(graph, target_sequence[step]) # [N, Q]
+                xi_shifted = self.xi_velocities.unsqueeze(0) + torch.round(target_sequence[step][..., :1])
+                f_current_full = self.boltzmann_updater.convert_to_unified(f_current_local, xi_shifted)  # Convert to unified range
                 source_input = target_sequence[step]  # [N, d]
             else:
                 # Use model prediction for source term
-                f_current = f_next
-                source_input = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # [N, d]
+                xi_shifted = self.xi_velocities.unsqueeze(0) + torch.round(macro_next)
+                f_current_full = f_next_full
+                source_input = torch.cat([macro_next,target_sequence[step][...,1:]],dim=-1)  # [N, d]
             # 3. Compute source term (carries historical memory)
             source_term, self.source_hidden = self.source_rnn(graph, source_input, 
                                                               self.source_hidden)
-            
+            f_current_local = self.boltzmann_updater.convert_to_local(f_current_full, xi_shifted)  # Convert to local range
             # 4. Compute collision term (physical constraints)
-            collision_term = self.collision_op(f_current)
+            collision_term = self.collision_op(f_current_local, source_input[..., :1])  # [N, Q]
             # constraint_losses.append(constraint_loss)
             
             # 5. Update using Boltzmann equation (physics-informed temporal evolution)
-            f_next = self.boltzmann_updater(graph, f_current, collision_term, source_term)
+            f_next_full = self.boltzmann_updater(graph, f_current_local, xi_shifted, collision_term, source_term)
             
             # 6. Decode: meso → macro
-            macro_next = self.meso_to_macro(f_next, macro_next)  # [N, d]
+            macro_next = self.meso_to_macro(f_next_full)  # [N, 1]
             
             predictions.append(macro_next)
             # current_macro = torch.cat([macro_next,target_sequence[step][...,self.d_features:]],dim=-1)  # Update for next iteration??
@@ -742,192 +685,192 @@ class KineticForecastingFramework(nn.Module):
 
 #     print(f"Total time: {time.time() - t0:.4f} seconds")
 
-if __name__ == '__main__':
-    """
-    Test KineticForecastingFramework integration
-    """
-    print("Testing KineticForecastingFramework...")
+# if __name__ == '__main__':
+#     """
+#     Test KineticForecastingFramework integration
+#     """
+#     print("Testing KineticForecastingFramework...")
     
-    # Test parameters
-    N = 10  # Number of nodes
-    T = 5   # Historical sequence length
-    d_features = 1  # Macro feature dimension
-    d_features_source = 2  # Source term feature dimension
-    Q_mesoscale = 6  # Mesoscale velocity components
-    num_pred_steps = 5  # Prediction steps
+#     # Test parameters
+#     N = 10  # Number of nodes
+#     T = 5   # Historical sequence length
+#     d_features = 2  # Macro feature dimension
+#     d_features_source = 2  # Source term feature dimension
+#     Q_mesoscale = 7  # Mesoscale velocity components
+#     num_pred_steps = 5  # Prediction steps
     
-    # Create velocity grid
-    xi_velocities = torch.randn(Q_mesoscale)
+#     # Create velocity grid
+#     xi_velocities = torch.linspace(-3,3,Q_mesoscale)  # [Q_mesoscale]
     
-    # Create test graph
-    edges = [(i, (i+1) % N) for i in range(N)]  # Ring graph
-    edges += [(i, (i+2) % N) for i in range(N)]  # Add some long-range connections
-    src, dst = zip(*edges)
-    graph = dgl.graph((src, dst), num_nodes=N)
+#     # Create test graph
+#     edges = [(i, (i+1) % N) for i in range(N)]  # Ring graph
+#     edges += [(i, (i+2) % N) for i in range(N)]  # Add some long-range connections
+#     src, dst = zip(*edges)
+#     graph = dgl.graph((src, dst), num_nodes=N)
     
-    # Add graph properties
-    graph.edata['weight'] = torch.rand(graph.number_of_edges()) * 0.5 + 0.5
-    graph.ndata['out_degree'] = graph.out_degrees().float().clamp(min=1.0)
-    graph.ndata['in_degree'] = graph.in_degrees().float().clamp(min=1.0)
+#     # Add graph properties
+#     graph.edata['weight'] = torch.rand(graph.number_of_edges()) * 0.5 + 0.5
+#     graph.ndata['out_degree'] = graph.out_degrees().float().clamp(min=1.0)
+#     graph.ndata['in_degree'] = graph.in_degrees().float().clamp(min=1.0)
     
-    graph = graph.to('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Graph: {N} nodes, {graph.number_of_edges()} edges")
+#     graph = graph.to('cuda' if torch.cuda.is_available() else 'cpu')
+#     print(f"Graph: {N} nodes, {graph.number_of_edges()} edges")
     
-    k = 2
-    out_graph_list, in_graph_list = DiffConv.attach_graph(graph, k)
+#     k = 2
+#     out_graph_list, in_graph_list = DiffConv.attach_graph(graph, k)
 
-    conv_params = {
-        "k": k,
-        "in_graph_list": in_graph_list,
-        "out_graph_list": out_graph_list,
-    }
+#     conv_params = {
+#         "k": k,
+#         "in_graph_list": in_graph_list,
+#         "out_graph_list": out_graph_list,
+#     }
 
 
-    # Initialize framework
-    model = KineticForecastingFramework(
-        d_features=d_features,
-        d_features_source=d_features_source,
-        Q_mesoscale=Q_mesoscale,
-        xi_velocities=xi_velocities,
-        spatial_conv_type='diffconv',
-        conv_params=conv_params,
-        collision_constraint='hard',
-        dt=0.1,
-        decay_steps=1000,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    ).to('cuda' if torch.cuda.is_available() else 'cpu')
+#     # Initialize framework
+#     model = KineticForecastingFramework(
+#         d_features=d_features,
+#         d_features_source=d_features_source,
+#         Q_mesoscale=Q_mesoscale,
+#         xi_velocities=xi_velocities,
+#         spatial_conv_type='gaan',
+#         conv_params=conv_params,
+#         collision_constraint='hard',
+#         dt=0.1,
+#         decay_steps=1000,
+#         device='cuda' if torch.cuda.is_available() else 'cpu'
+#     ).to('cuda' if torch.cuda.is_available() else 'cpu')
     
-    print(f"Framework initialized with {sum(p.numel() for p in model.parameters())} parameters")
+#     print(f"Framework initialized with {sum(p.numel() for p in model.parameters())} parameters")
     
-    # Create test data
-    macro_sequence = torch.randn(T, N, d_features_source) * 0.5 + 1.0  # [T, N, d]
-    target_sequence = torch.randn(num_pred_steps, N, d_features_source) * 0.5 + 1.0  # [num_pred_steps, N, d]
+#     # Create test data
+#     macro_sequence = torch.randn(T, N, d_features_source) * 0.5 + 1.0  # [T, N, d]
+#     target_sequence = torch.randn(num_pred_steps, N, d_features_source) * 0.5 + 1.0  # [num_pred_steps, N, d]
     
-    print(f"Input sequence shape: {macro_sequence.shape}")
-    print(f"Target sequence shape: {target_sequence.shape}")
+#     print(f"Input sequence shape: {macro_sequence.shape}")
+#     print(f"Target sequence shape: {target_sequence.shape}")
     
-    print("\n" + "="*60)
-    print("Testing Training Mode...")
+#     print("\n" + "="*60)
+#     print("Testing Training Mode...")
     
-    # Test training mode
-    model.train()
-    print(f"Training mode: {model.training}")
+#     # Test training mode
+#     model.train()
+#     print(f"Training mode: {model.training}")
     
-    try:
-        # Test teacher forcing threshold
-        for batch_cnt in [0, 500, 1000, 2000, 5000]:
-            threshold = model.compute_teacher_forcing_threshold(batch_cnt)
-            print(f"Batch {batch_cnt}: Teacher forcing threshold = {threshold:.4f}")
+#     try:
+#         # Test teacher forcing threshold
+#         for batch_cnt in [0, 500, 1000, 2000, 5000]:
+#             threshold = model.compute_teacher_forcing_threshold(batch_cnt)
+#             print(f"Batch {batch_cnt}: Teacher forcing threshold = {threshold:.4f}")
         
-        print("\nTesting forward pass in training mode...")
-        predictions, reconstructions = model(
-            graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'), 
-            num_pred_steps=num_pred_steps,
-            target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
-            batch_cnt=100
-        )
+#         print("\nTesting forward pass in training mode...")
+#         predictions, reconstructions = model(
+#             graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'), 
+#             num_pred_steps=num_pred_steps,
+#             target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
+#             batch_cnt=100
+#         )
         
-        print(f"Training forward pass successful!")
-        print(f"Predictions shape: {predictions.shape}")
-        print(f"Reconstructions shape: {reconstructions.shape if reconstructions is not None else None}")
+#         print(f"Training forward pass successful!")
+#         print(f"Predictions shape: {predictions.shape}")
+#         print(f"Reconstructions shape: {reconstructions.shape if reconstructions is not None else None}")
         
-        # Check shapes
-        assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
-        assert reconstructions.shape == (T, N, d_features), f"Wrong reconstructions shape: {reconstructions.shape}"
-        print("Training mode shapes correct!")
+#         # Check shapes
+#         assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
+#         assert reconstructions.shape == (T, N, d_features), f"Wrong reconstructions shape: {reconstructions.shape}"
+#         print("Training mode shapes correct!")
         
-    except Exception as e:
-        print(f"Training mode error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+#     except Exception as e:
+#         print(f"Training mode error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         exit(1)
     
-    print("\n" + "="*60)
-    print("Testing Evaluation Mode...")
+#     print("\n" + "="*60)
+#     print("Testing Evaluation Mode...")
     
-    # Test evaluation mode
-    model.eval()
-    print(f"Training mode: {model.training}")
+#     # Test evaluation mode
+#     model.eval()
+#     print(f"Training mode: {model.training}")
     
-    try:
-        # Reset hidden state
-        model.source_hidden = None
+#     try:
+#         # Reset hidden state
+#         model.source_hidden = None
         
-        predictions, reconstructions = model(
-            graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
-            num_pred_steps=num_pred_steps,
-            target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),  # No targets in eval
-            batch_cnt=100
-        )
+#         predictions, reconstructions = model(
+#             graph, macro_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),
+#             num_pred_steps=num_pred_steps,
+#             target_sequence=target_sequence.to('cuda' if torch.cuda.is_available() else 'cpu'),  # No targets in eval
+#             batch_cnt=100
+#         )
         
-        print(f"Evaluation forward pass successful!")
-        print(f"Predictions shape: {predictions.shape}")
-        print(f"Reconstructions: {reconstructions}")  # Should be None
+#         print(f"Evaluation forward pass successful!")
+#         print(f"Predictions shape: {predictions.shape}")
+#         print(f"Reconstructions: {reconstructions}")  # Should be None
         
-        # Check shapes
-        assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
-        print("Evaluation mode shapes correct!")
+#         # Check shapes
+#         assert predictions.shape == (num_pred_steps, N, d_features), f"Wrong predictions shape: {predictions.shape}"
+#         print("Evaluation mode shapes correct!")
         
-    except Exception as e:
-        print(f"Evaluation mode error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+#     except Exception as e:
+#         print(f"Evaluation mode error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         exit(1)
     
-    print("\n" + "="*60)
-    print("Testing Multiple Steps and Consistency...")
+#     print("\n" + "="*60)
+#     print("Testing Multiple Steps and Consistency...")
     
-    try:
-        model.train()
+#     try:
+#         model.train()
         
-        # Test different prediction lengths
-        for steps in [1, 3, 5]:
-            model.source_hidden = None
-            predictions, reconstructions = model(
-                graph, macro_sequence,
-                num_pred_steps=steps,
-                target_sequence=torch.randn(steps, N, d_features_source),
-                batch_cnt=500
-            )
-            print(f"Steps {steps}: predictions {predictions.shape}, reconstructions {reconstructions.shape}")
+#         # Test different prediction lengths
+#         for steps in [1, 3, 5]:
+#             model.source_hidden = None
+#             predictions, reconstructions = model(
+#                 graph, macro_sequence,
+#                 num_pred_steps=steps,
+#                 target_sequence=torch.randn(steps, N, d_features_source),
+#                 batch_cnt=500
+#             )
+#             print(f"Steps {steps}: predictions {predictions.shape}, reconstructions {reconstructions.shape}")
         
-        # Test numerical stability
-        model.source_hidden = None
-        predictions, _ = model(
-            graph, macro_sequence,
-            num_pred_steps=10,  # Longer prediction
-            target_sequence=torch.randn(10, N, d_features_source),
-            batch_cnt=1000
-        )
+#         # Test numerical stability
+#         model.source_hidden = None
+#         predictions, _ = model(
+#             graph, macro_sequence,
+#             num_pred_steps=10,  # Longer prediction
+#             target_sequence=torch.randn(10, N, d_features_source),
+#             batch_cnt=1000
+#         )
         
-        if torch.isnan(predictions).any():
-            print("Warning: NaN values detected in predictions")
-        else:
-            print("No NaN values in extended predictions")
+#         if torch.isnan(predictions).any():
+#             print("Warning: NaN values detected in predictions")
+#         else:
+#             print("No NaN values in extended predictions")
             
-        if torch.isinf(predictions).any():
-            print("Warning: Infinite values detected in predictions")
-        else:
-            print("No infinite values in extended predictions")
+#         if torch.isinf(predictions).any():
+#             print("Warning: Infinite values detected in predictions")
+#         else:
+#             print("No infinite values in extended predictions")
         
-        print(f"Extended prediction range: [{predictions.min():.4f}, {predictions.max():.4f}]")
+#         print(f"Extended prediction range: [{predictions.min():.4f}, {predictions.max():.4f}]")
         
-    except Exception as e:
-        print(f"Multi-step test error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+#     except Exception as e:
+#         print(f"Multi-step test error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         exit(1)
     
-    print("\n" + "="*60)
-    print("All tests passed! KineticForecastingFramework is working correctly.")
+#     print("\n" + "="*60)
+#     print("All tests passed! KineticForecastingFramework is working correctly.")
     
-    print("\nFramework Summary:")
-    print(f"- Input features: {d_features}")
-    print(f"- Mesoscale components: {Q_mesoscale}")
-    print(f"- Velocity grid: {xi_velocities}")
-    print(f"- Total parameters: {sum(p.numel() for p in model.parameters())}")
-    print(f"- Decay steps: {model.decay_steps}")
-    print(f"- Training mode support: pass")
-    print(f"- Teacher forcing: pass")
-    print(f"- Reconstruction loss: pass")
-    print(f"- Multi-step prediction: pass")
+#     print("\nFramework Summary:")
+#     print(f"- Input features: {d_features}")
+#     print(f"- Mesoscale components: {Q_mesoscale}")
+#     print(f"- Velocity grid: {xi_velocities}")
+#     print(f"- Total parameters: {sum(p.numel() for p in model.parameters())}")
+#     print(f"- Decay steps: {model.decay_steps}")
+#     print(f"- Training mode support: pass")
+#     print(f"- Teacher forcing: pass")
+#     print(f"- Reconstruction loss: pass")
+#     print(f"- Multi-step prediction: pass")

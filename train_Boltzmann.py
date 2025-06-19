@@ -64,18 +64,18 @@ def train(
         x = x.permute(1, 0, 2, 3)
         y = y.permute(1, 0, 2, 3)
 
-        x_norm = (
-            normalizer.normalize(x)
-            .reshape(x.shape[0], -1, x.shape[3])
-            .float()
-            .to(device)
-        )
-        y_norm = (
-            normalizer.normalize(y)
-            .reshape(x.shape[0], -1, x.shape[3])
-            .float()
-            .to(device)
-        )
+        # x_norm = (
+        #     normalizer.normalize(x)
+        #     .reshape(x.shape[0], -1, x.shape[3])
+        #     .float()
+        #     .to(device)
+        # )
+        # y_norm = (
+        #     normalizer.normalize(y)
+        #     .reshape(x.shape[0], -1, x.shape[3])
+        #     .float()
+        #     .to(device)
+        # )
         x = x.reshape(x.shape[0], -1, x.shape[3]).float().to(device)
         y = y.reshape(y.shape[0], -1, y.shape[3]).float().to(device)
 
@@ -85,12 +85,9 @@ def train(
         #         f"Shape mismatch: x_norm {x_norm.shape} vs y_norm {y_norm.shape}"
         #     )
 
-        output, reconstruct = model(graph=graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
-        # Denormalization for loss compute
-        y_reconstruct = normalizer.denormalize(reconstruct)
-        y_pred = normalizer.denormalize(output)
-        loss_predict = loss_fn(y_pred, y[...,:1])
-        loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
+        output, reconstruct = model(graph=graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0])
+        loss_predict = loss_fn(output, y[...,:1])
+        loss_reconstruct = loss_fn(reconstruct, x[...,:1])
         loss = loss_predict + loss_reconstruct
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -132,26 +129,24 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
         x = x.permute(1, 0, 2, 3)
         y = y.permute(1, 0, 2, 3)
 
-        x_norm = (
-            normalizer.normalize(x)
-            .reshape(x.shape[0], -1, x.shape[3])
-            .float()
-            .to(device)
-        )
-        y_norm = (
-            normalizer.normalize(y)
-            .reshape(x.shape[0], -1, x.shape[3])
-            .float()
-            .to(device)
-        )
+        # x_norm = (
+        #     normalizer.normalize(x)
+        #     .reshape(x.shape[0], -1, x.shape[3])
+        #     .float()
+        #     .to(device)
+        # )
+        # y_norm = (
+        #     normalizer.normalize(y)
+        #     .reshape(x.shape[0], -1, x.shape[3])
+        #     .float()
+        #     .to(device)
+        # )
         x = x.reshape(x.shape[0], -1, x.shape[3]).to(device)
         y = y.reshape(y.shape[0], -1, y.shape[3]).to(device)
 
         # batch_graph = dgl.batch([graph] * batch_size)
-        output, y_reconstruct = model(graph = graph, macro_features_sequence=x_norm, num_pred_steps=x.shape[0], target_sequence=y_norm, batch_cnt = batch_cnt[0])
-        y_pred = normalizer.denormalize(output)
-        y_reconstruct = normalizer.denormalize(y_reconstruct)
-        loss_predict = loss_fn(y_pred, y[...,:1])
+        output, y_reconstruct = model(graph = graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0])
+        loss_predict = loss_fn(output, y[...,:1])
         loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
         predict_loss.append(float(loss_predict))
         reconstructed_loss.append(float(loss_reconstruct))
@@ -203,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--minimum_lr",
         type=float,
-        default=1e-6,
+        default=2e-6,
         help="Lower bound of learning rate",
     )
     parser.add_argument(
@@ -290,19 +285,23 @@ if __name__ == "__main__":
 
     conv_params = {
         "k": k,
-        "in_graph_list": in_graph_list,
-        "out_graph_list": out_graph_list,
+        "in_graph_list": in_graph_list if args.model == "diffconv" else None,
+        "out_graph_list": out_graph_list if args.model == "diffconv" else None,
+        'map_feats': 64,
+        'num_heads': args.num_heads if args.model == "gaan" else None,
     }
     
-    xi_num = 12
+    xi_num = 21
     num_macro_to_meso_layers = 1
     num_layers_collision = 8
 
     dcrnn = GraphRNN(
-        d_features=1,
+        d_features=2,
         d_features_source=2,
         Q_mesoscale=xi_num,
-        xi_velocities=torch.linspace(0,1,xi_num).to(device),
+        xi_velocities=torch.linspace(-10,10,xi_num).to(device),
+        min_macrovelocity=0,
+        max_macrovelocity=70,
         num_layers_macro_to_meso=num_macro_to_meso_layers,
         spatial_conv_type=args.model,
         conv_params=conv_params,
