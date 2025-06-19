@@ -87,7 +87,8 @@ def train(
             scheduler.step()
         total_loss.append(float(loss))
         batch_cnt[0] += 1
-        print("\rBatch: ", i, end="")
+        # print("\rBatch: ", i, end="")
+        print(f"\rBatch: {i} Loss: {loss:.4f}", end="")
     return np.mean(total_loss)
 
 

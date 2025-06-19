@@ -202,11 +202,12 @@ class SGraphRNN(nn.Module):
     Similar to GraphRNN but operates entirely in Q-dimensional space.
     """
     def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, hidden_dim: int = 64,
-                 spatial_conv_type: str = 'gaan', conv_params: dict = None, is_SGRNN: bool = True):
+                 spatial_conv_type: str = 'gaan', conv_params: dict = None, is_SGRNN: bool = True, out_num_layers: int = 5, out_hidden_dim: int = 128):
         super(SGraphRNN, self).__init__()
         self.d_features = d_features
         self.Q_mesoscale = Q_mesoscale
         self.hidden_dim = hidden_dim
+        self.out_hidden_dim = out_hidden_dim
         
         # Encoder: d → Q (with spatial information)
         self.encoder = MacroToMesoEncoder(d_features, Q_mesoscale, num_layers,
@@ -216,7 +217,22 @@ class SGraphRNN(nn.Module):
         self.gru_cell = nn.GRUCell(Q_mesoscale, hidden_dim)
         
         # Output projection: hidden → Q (source term)
-        self.output_proj = nn.Linear(hidden_dim, Q_mesoscale)
+        # self.output_proj = nn.Linear(hidden_dim, Q_mesoscale)
+        self.output_mlp = self._build_mlp(
+            hidden_dim, Q_mesoscale,
+            self.out_hidden_dim, out_num_layers
+        )
+
+    @staticmethod
+    def _build_mlp(in_dim, out_dim, hidden_dim, num_layers):
+        layers = []
+        for i in range(num_layers):
+            in_d  = in_dim  if i == 0 else hidden_dim
+            out_d = out_dim if i == num_layers - 1 else hidden_dim
+            layers.append(nn.Linear(in_d, out_d))
+            if i < num_layers - 1:
+                layers.append(nn.Tanh())
+        return nn.Sequential(*layers)
     
     def forward(self, graph, macro_features, hidden_state=None):
         """
@@ -245,7 +261,7 @@ class SGraphRNN(nn.Module):
         new_hidden = new_hidden_flat.view(N, self.hidden_dim)
         
         # Generate source term
-        source_term = self.output_proj(new_hidden)  # [N, Q]
+        source_term = self.output_mlp(new_hidden)  # [N, Q]
         
         return source_term, new_hidden
 
@@ -440,7 +456,8 @@ class MesoToMacroDecoder(nn.Module):
 class KineticForecastingFramework(nn.Module):
     def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor, min_macrovelocity=0, max_macrovelocity=70, num_layers_macro_to_meso: int = 1,
                  spatial_conv_type: str = 'gaan', conv_params: dict = None,
-                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6, base_graph = None):
+                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6, base_graph = None, 
+                 source_mlp_num_layers: int = 5, source_mlp_hidden_dim: int = 128):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
@@ -466,7 +483,7 @@ class KineticForecastingFramework(nn.Module):
         # Module 3: SGraphRNN (for source term)
         self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale, num_layers = num_layers_macro_to_meso,
                                    spatial_conv_type=spatial_conv_type,
-                                   conv_params=conv_params, is_SGRNN=True)
+                                   conv_params=conv_params, is_SGRNN=True, out_num_layers=source_mlp_num_layers, out_hidden_dim=source_mlp_hidden_dim)
         
         # Module 4: CollisionOperator
         self.collision_op = CollisionOperator(Q_mesoscale, constraint_type=collision_constraint,

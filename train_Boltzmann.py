@@ -141,8 +141,8 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
         #     .float()
         #     .to(device)
         # )
-        x = x.reshape(x.shape[0], -1, x.shape[3]).to(device)
-        y = y.reshape(y.shape[0], -1, y.shape[3]).to(device)
+        x = x.reshape(x.shape[0], -1, x.shape[3]).float().to(device)
+        y = y.reshape(y.shape[0], -1, y.shape[3]).float().to(device)
 
         # batch_graph = dgl.batch([graph] * batch_size)
         output, y_reconstruct = model(graph = graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0])
@@ -184,7 +184,10 @@ if __name__ == "__main__":
         help="Step of constructing the diffusiob matrix",
     )
     parser.add_argument(
-        "--num_heads", type=int, default=2, help="Number of multiattention head"
+        "--num_heads", type=int, default=6, help="Number of multiattention head"
+    )
+    parser.add_argument(
+        "--map_feats", type=int, default=128
     )
     parser.add_argument(
         "--decay_steps",
@@ -266,34 +269,36 @@ if __name__ == "__main__":
     )
     normalizer = NormalizationLayer(train_data.mean, train_data.std)
 
-    if args.model == "diffconv":
-        batch_g = dgl.batch([g] * args.batch_size).to(device)
-        out_gs, in_gs = DiffConv.attach_graph(batch_g, args.diffsteps)
-        net = partial(
-            DiffConv,
-            k=args.diffsteps,
-            in_graph_list=in_gs,
-            out_graph_list=out_gs,
-        )
-    elif args.model == "gaan":
-        net = partial(GatedGAT, map_feats=64, num_heads=args.num_heads)
+    # if args.model == "diffconv":
+    #     batch_g = dgl.batch([g] * args.batch_size).to(device)
+    #     out_gs, in_gs = DiffConv.attach_graph(batch_g, args.diffsteps)
+    #     net = partial(
+    #         DiffConv,
+    #         k=args.diffsteps,
+    #         in_graph_list=in_gs,
+    #         out_graph_list=out_gs,
+    #     )
+    # elif args.model == "gaan":
+    #     net = partial(GatedGAT, map_feats=64, num_heads=args.num_heads)
 
     batch_g = dgl.batch([g] * args.batch_size).to(device)
 
-    k = 2
-    out_graph_list, in_graph_list = DiffConv.attach_graph(batch_g, k)
+    # k = 2
+    # out_graph_list, in_graph_list = DiffConv.attach_graph(batch_g, k)
 
     conv_params = {
-        "k": k,
-        "in_graph_list": in_graph_list if args.model == "diffconv" else None,
-        "out_graph_list": out_graph_list if args.model == "diffconv" else None,
-        'map_feats': 64,
+        # "k": 2,
+        # "in_graph_list": in_graph_list if args.model == "diffconv" else None,
+        # "out_graph_list": out_graph_list if args.model == "diffconv" else None,
+        'map_feats': args.map_feats if args.model == "gaan" else None,
         'num_heads': args.num_heads if args.model == "gaan" else None,
     }
     
     xi_num = 21
     num_macro_to_meso_layers = 1
     num_layers_collision = 8
+    source_mlp_num_layers = 6
+    source_mlp_hidden_dim = 128
 
     dcrnn = GraphRNN(
         d_features=2,
@@ -310,7 +315,9 @@ if __name__ == "__main__":
         decay_steps=args.decay_steps,
         device=device,
         num_layers_collision=num_layers_collision,
-        base_graph= batch_g
+        base_graph= batch_g,
+        source_mlp_num_layers=source_mlp_num_layers,
+        source_mlp_hidden_dim=source_mlp_hidden_dim,
     ).to(device)
 
     optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)

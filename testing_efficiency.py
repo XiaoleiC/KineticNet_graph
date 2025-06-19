@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 g = METR_LAGraphDataset()
-batch_size = 4
+batch_size = 64
 batch_g = dgl.batch([g] * batch_size).to(device)
 
 conv_params = {
