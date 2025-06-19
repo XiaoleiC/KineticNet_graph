@@ -49,7 +49,8 @@ model = GraphRNN(
         dt=5/60,
         decay_steps=2000,
         device=device,
-        num_layers_collision=5
+        num_layers_collision=5,
+        base_graph = batch_g
     ).to(device)
 
 print('model class finished...')

@@ -258,7 +258,16 @@ class BoltzmannUpdater(nn.Module):
         self.min_macrovelocity = min_macrovelocity
         self.max_macrovelocity = max_macrovelocity
         self.unified_size = max_macrovelocity - min_macrovelocity + 1
-        
+        if base_graph is None:
+            raise ValueError("base_graph must be provided for BoltzmannUpdater")
+        self.graph = dgl.remove_self_loop(base_graph)
+        self.reverse_graph = dgl.reverse(base_graph, copy_ndata=True, copy_edata=True)
+        self.graph.ndata['out_degree'] = self.graph.out_degrees().float()
+        self.graph.ndata['in_degree'] = self.graph.in_degrees().float()
+        self.reverse_graph.ndata['out_degree'] = self.reverse_graph.out_degrees().float()
+        self.reverse_graph.ndata['in_degree'] = self.reverse_graph.in_degrees().float()
+        self.xi_unified = torch.arange(min_macrovelocity, max_macrovelocity + 1, device=base_graph.device)
+        self.xi_broadcast = self.xi_unified.unsqueeze(0)
             
     def convert_to_local(self, f_unified, xi_per_node):
         offsets = (xi_per_node - self.min_macrovelocity).long()
@@ -270,86 +279,113 @@ class BoltzmannUpdater(nn.Module):
         return f_local         
 
     def convert_to_unified(self, f_local, xi_per_node):
-        # f_local: [N,Q]   xi_per_node: [N,Q]
-        offsets = (xi_per_node - self.min_macrovelocity).long()        # [N,Q]
-        mask    = (offsets >= 0) & (offsets < self.unified_size)       # bool
+        offsets = (xi_per_node - self.min_macrovelocity).long()
+        mask    = (offsets >= 0) & (offsets < self.unified_size)
         row_idx = torch.arange(f_local.size(0), device=f_local.device).unsqueeze(1)
         f_uni   = torch.zeros(f_local.size(0), self.unified_size, device=f_local.device,
                             dtype=f_local.dtype)
         f_uni[row_idx.expand_as(offsets)[mask], offsets[mask]] = f_local[mask]
         return f_uni
     
-    def compute_transport_term(self, graph, f_distribution):
-        # graph = graph.clone()
-        graph = dgl.remove_self_loop(graph)  # Remove self-loops for transport computation
-        with graph.local_scope():
-            # Store distribution on nodes
-            graph.ndata['f'] = f_distribution  # [N, unified_size]
-            reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
+    def compute_transport_term(self, f_distribution):
+        g = self.graph
+        reverse_g = self.reverse_graph
+        g.ndata['f'] = f_distribution
 
-            graph.ndata['out_degree'] = graph.out_degrees().float()  # [N]
-            graph.ndata['in_degree'] = graph.in_degrees().float()  # [N]
-            reverse_graph.ndata['out_degree'] = reverse_graph.out_degrees().float()
-            reverse_graph.ndata['in_degree'] = reverse_graph.in_degrees().float()
+        def msg_in(edges):
+            f_diff = edges.dst["f"] - edges.src["f"]
+            edge_w = edges.data["weight"].unsqueeze(1)
+            q_ij = (1.0 / edges.src["out_degree"]).unsqueeze(1)
+            xi_exp = self.xi_broadcast.expand(f_diff.shape[0], -1)
+            return {"transport_all": q_ij * xi_exp * f_diff * edge_w}
+        
+        def msg_out(edges):
+            f_diff = edges.src["f"] - edges.dst["f"]
+            edge_w = edges.data["weight"].unsqueeze(1)
+            q_ij = (1.0 / edges.dst["in_degree"]).unsqueeze(1)
+            xi_exp = self.xi_broadcast.expand(f_diff.shape[0], -1)
+            return {"transport_all": q_ij * xi_exp * f_diff * edge_w}
+        
+        def red(nodes):
+            return {"transport_sum_all": nodes.mailbox["transport_all"].sum(dim=1)}
+        
+        g.update_all(msg_in, red)
+        inflow = g.ndata.pop('transport_sum_all')
+
+        reverse_g.ndata['f'] = f_distribution
+        reverse_g.update_all(msg_out, red)
+        outflow = reverse_g.ndata.pop('transport_sum_all')
+
+        return outflow - inflow
+
+        # with graph.local_scope():
+        #     # Store distribution on nodes
+        #     graph.ndata['f'] = f_distribution  # [N, unified_size]
+        #     reverse_graph = dgl.reverse(graph, copy_ndata=True, copy_edata=True)
+
+        #     graph.ndata['out_degree'] = graph.out_degrees().float()  # [N]
+        #     graph.ndata['in_degree'] = graph.in_degrees().float()  # [N]
+        #     reverse_graph.ndata['out_degree'] = reverse_graph.out_degrees().float()
+        #     reverse_graph.ndata['in_degree'] = reverse_graph.in_degrees().float()
             
-            xi_unified = torch.arange(self.min_macrovelocity, self.max_macrovelocity + 1, device=f_distribution.device)  # [unified_size]
-            xi_broadcast = xi_unified.unsqueeze(0)  # [1, unified_size]
+        #     xi_unified = torch.arange(self.min_macrovelocity, self.max_macrovelocity + 1, device=f_distribution.device)  # [unified_size]
+        #     xi_broadcast = xi_unified.unsqueeze(0)  # [1, unified_size]
             
-            # Inflow computation (vectorized over all velocity components)
-            def message_func_inflow(edges):
-                f_diff = edges.dst['f'] - edges.src['f']  # [E, unified_size]
+        #     # Inflow computation (vectorized over all velocity components)
+        #     def message_func_inflow(edges):
+        #         f_diff = edges.dst['f'] - edges.src['f']  # [E, unified_size]
                 
-                # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
-                edge_weight = edges.data['weight']
-                edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
+        #         # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
+        #         edge_weight = edges.data['weight']
+        #         edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
                 
-                q_ij = (1.0 / edges.src['out_degree']).unsqueeze(1)  # [E, 1], !!! The problem is that we assume the weight is the same for all particle velocities
+        #         q_ij = (1.0 / edges.src['out_degree']).unsqueeze(1)  # [E, 1], !!! The problem is that we assume the weight is the same for all particle velocities
                 
-                # Broadcast xi_velocities: [1, Q] -> [E, Q]
-                xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, unified_size]
+        #         # Broadcast xi_velocities: [1, Q] -> [E, Q]
+        #         xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, unified_size]
                 
-                # Compute transport for all velocity components: [E, Q]
-                transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, Q]
+        #         # Compute transport for all velocity components: [E, Q]
+        #         transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, Q]
                 
-                return {'transport_all': transport}
+        #         return {'transport_all': transport}
             
-            # Outflow computation (vectorized over all velocity components)  
-            def message_func_outflow(edges):
-                # f_diff: [E, Q] - differences for all velocity components
-                f_diff = edges.src['f'] - edges.dst['f']  # [E, unified_size]
+        #     # Outflow computation (vectorized over all velocity components)  
+        #     def message_func_outflow(edges):
+        #         # f_diff: [E, Q] - differences for all velocity components
+        #         f_diff = edges.src['f'] - edges.dst['f']  # [E, unified_size]
                 
-                # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
-                edge_weight = edges.data['weight']
-                edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
+        #         # Edge weights and q_ij: [E] -> [E, 1] for broadcasting
+        #         edge_weight = edges.data['weight']
+        #         edge_weight = edge_weight.unsqueeze(1)  # [E, 1]
                 
-                q_ij = (1.0 / edges.dst['in_degree']).unsqueeze(1)  # [E, 1]
+        #         q_ij = (1.0 / edges.dst['in_degree']).unsqueeze(1)  # [E, 1]
                 
-                # Broadcast xi_velocities: [1, Q] -> [E, Q]
-                xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, unified_size]
+        #         # Broadcast xi_velocities: [1, Q] -> [E, Q]
+        #         xi_expanded = xi_broadcast.expand(f_diff.shape[0], -1)  # [E, unified_size]
                 
-                # Compute transport for all velocity components: [E, unified_size]
-                transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, unified_size]
+        #         # Compute transport for all velocity components: [E, unified_size]
+        #         transport = q_ij * xi_expanded * f_diff * edge_weight  # [E, unified_size]
                 
-                return {'transport_all': transport}
+        #         return {'transport_all': transport}
             
-            # Reduce function: sum over neighbors for all velocity components
-            def reduce_func(nodes):
-                return {'transport_sum_all': torch.sum(nodes.mailbox['transport_all'], dim=1)}
+        #     # Reduce function: sum over neighbors for all velocity components
+        #     def reduce_func(nodes):
+        #         return {'transport_sum_all': torch.sum(nodes.mailbox['transport_all'], dim=1)}
             
-            # Single message passing for inflow (all velocity components)
-            graph.update_all(message_func_inflow, reduce_func)
-            inflow = graph.ndata['transport_sum_all'].clone()  # [N, Q]
+        #     # Single message passing for inflow (all velocity components)
+        #     graph.update_all(message_func_inflow, reduce_func)
+        #     inflow = graph.ndata['transport_sum_all'].clone()  # [N, Q]
             
-            # Single message passing for outflow (all velocity components)
-            reverse_graph.update_all(message_func_outflow, reduce_func)
-            outflow = reverse_graph.ndata['transport_sum_all'].clone()  # [N, Q]
+        #     # Single message passing for outflow (all velocity components)
+        #     reverse_graph.update_all(message_func_outflow, reduce_func)
+        #     outflow = reverse_graph.ndata['transport_sum_all'].clone()  # [N, Q]
             
-            # Final transport term: [N, Q]
-            transport_term = outflow - inflow
+        #     # Final transport term: [N, Q]
+        #     transport_term = outflow - inflow
             
-        return transport_term
+        # return transport_term
     
-    def forward(self, graph, f_distribution_local, xi_velocity_per_node, collision_term_local, source_term_local):
+    def forward(self, f_distribution_local, xi_velocity_per_node, collision_term_local, source_term_local):
         """
         Update distribution using Boltzmann equation.
         
@@ -366,7 +402,7 @@ class BoltzmannUpdater(nn.Module):
         collision_term = self.convert_to_unified(collision_term_local, xi_velocity_per_node)  # Convert collision term to unified range
         source_term = self.convert_to_unified(source_term_local, xi_velocity_per_node)  # Convert source term to unified range
         # Compute transport term
-        transport_term = self.compute_transport_term(graph, f_distribution)
+        transport_term = self.compute_transport_term(f_distribution)
         
         # Boltzmann update: f(t+Δt) = f(t) - Δt[Transport - Collision - Source]
         f_new = f_distribution - self.dt * (transport_term - collision_term - source_term)
@@ -404,7 +440,7 @@ class MesoToMacroDecoder(nn.Module):
 class KineticForecastingFramework(nn.Module):
     def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, xi_velocities: torch.Tensor, min_macrovelocity=0, max_macrovelocity=70, num_layers_macro_to_meso: int = 1,
                  spatial_conv_type: str = 'gaan', conv_params: dict = None,
-                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6):
+                 collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6, base_graph = None):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
@@ -422,11 +458,13 @@ class KineticForecastingFramework(nn.Module):
         self.macro_to_meso = MacroToMesoEncoder(d_features=d_features, Q_mesoscale=Q_mesoscale, num_layers=num_layers_macro_to_meso,
                                                spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False)
          
+        if base_graph is None:
+            raise ValueError("base_graph must be provided for KineticForecastingFramework")
         # Module 2: BoltzmannUpdater  
-        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, dt, min_macrovelocity=min_macrovelocity, max_macrovelocity=max_macrovelocity)
+        self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, dt, min_macrovelocity=min_macrovelocity, max_macrovelocity=max_macrovelocity, base_graph=base_graph)
         
         # Module 3: SGraphRNN (for source term)
-        self.source_rnn = SGraphRNN(d_features_source, self.unified_size, num_layers = num_layers_macro_to_meso,
+        self.source_rnn = SGraphRNN(d_features_source, Q_mesoscale, num_layers = num_layers_macro_to_meso,
                                    spatial_conv_type=spatial_conv_type,
                                    conv_params=conv_params, is_SGRNN=True)
         
@@ -503,7 +541,7 @@ class KineticForecastingFramework(nn.Module):
             reconstruction_outputs.append(macro_reconstructed)
         
         collision_term = self.collision_op(f_current_local,current_macro[...,:1])
-        f_next_full = self.boltzmann_updater(graph, f_current_local, xi_shifted, collision_term, source_term)
+        f_next_full = self.boltzmann_updater(f_current_local, xi_shifted, collision_term, source_term)
         macro_next = self.meso_to_macro(f_next_full)  # [N, 1]
         # Phase 2: Autoregressive prediction with adaptive teacher forcing
         predictions.append(macro_next)
@@ -533,7 +571,7 @@ class KineticForecastingFramework(nn.Module):
             # constraint_losses.append(constraint_loss)
             
             # 5. Update using Boltzmann equation (physics-informed temporal evolution)
-            f_next_full = self.boltzmann_updater(graph, f_current_local, xi_shifted, collision_term, source_term)
+            f_next_full = self.boltzmann_updater(f_current_local, xi_shifted, collision_term, source_term)
             
             # 6. Decode: meso → macro
             macro_next = self.meso_to_macro(f_next_full)  # [N, 1]

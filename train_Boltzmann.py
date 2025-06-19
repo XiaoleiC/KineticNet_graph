@@ -309,7 +309,8 @@ if __name__ == "__main__":
         dt=5/60,
         decay_steps=args.decay_steps,
         device=device,
-        num_layers_collision=num_layers_collision
+        num_layers_collision=num_layers_collision,
+        base_graph= batch_g
     ).to(device)
 
     optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)
