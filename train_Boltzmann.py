@@ -99,6 +99,10 @@ def train(
         batch_cnt[0] += 1
         # print("\rBatch: ", i, end="")
         print(f"\rBatch: {i} Predict Loss: {loss_predict:.4f} Reconstruct Loss: {loss_reconstruct:.4f}", end="")
+        # print(f'\nTarget Velocity of Node 0: {y[:,0,0]}')
+        # print(f'\nPredicted Velocity of Node 0: {output[:,0,0]}')
+        # print(f'\nTarget Reconstructed Velocity of Node 0: {x[:,0,0]}')
+        # print(f'\nPredicted Reconstructed Velocity of Node 0: {reconstruct[:,0,0]}')
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
@@ -201,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--minimum_lr",
         type=float,
-        default=2e-6,
+        default=1e-7,
         help="Lower bound of learning rate",
     )
     parser.add_argument(
@@ -294,19 +298,22 @@ if __name__ == "__main__":
         'num_heads': args.num_heads if args.model == "gaan" else None,
     }
     
-    xi_num = 21
+    Q_mesoscale = 71
+    min_macrovelocity = 0
+    max_macrovelocity = 70
+
     num_macro_to_meso_layers = 1
-    num_layers_collision = 8
-    source_mlp_num_layers = 6
+    num_layers_collision = 10
+    hidden_dim_collision = 128
+    source_mlp_num_layers = 10
     source_mlp_hidden_dim = 128
 
     dcrnn = GraphRNN(
         d_features=2,
         d_features_source=2,
-        Q_mesoscale=xi_num,
-        xi_velocities=torch.linspace(-10,10,xi_num).to(device),
-        min_macrovelocity=0,
-        max_macrovelocity=70,
+        Q_mesoscale=Q_mesoscale,
+        min_macrovelocity=min_macrovelocity,
+        max_macrovelocity=max_macrovelocity,
         num_layers_macro_to_meso=num_macro_to_meso_layers,
         spatial_conv_type=args.model,
         conv_params=conv_params,
@@ -315,6 +322,7 @@ if __name__ == "__main__":
         decay_steps=args.decay_steps,
         device=device,
         num_layers_collision=num_layers_collision,
+        hidden_dim_collision=hidden_dim_collision,
         base_graph= batch_g,
         source_mlp_num_layers=source_mlp_num_layers,
         source_mlp_hidden_dim=source_mlp_hidden_dim,

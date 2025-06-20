@@ -37,7 +37,6 @@ class MacroToMesoPretrainer(nn.Module):
         )
         self.decoder = MesoToMacroDecoder(
             Q_mesoscale=Q_mesoscale,
-            d_features=d_features,
             xi_velocities=xi_velocities
         )
 
@@ -45,8 +44,8 @@ class MacroToMesoPretrainer(nn.Module):
         T, N, _ = macro_x.shape
         recon_seq = []
         for t in range(T):
-            f_t = self.encoder(g, macro_x[t,:,:])
-            recon_t = self.decoder(f_t, macro_x[t,:,:1])
+            f_t = self.encoder(g, macro_x[t])
+            recon_t = self.decoder(f_t)
             recon_seq.append(recon_t) 
         return torch.stack(recon_seq, dim=0)
 
@@ -148,7 +147,7 @@ def main():
                        out_graph_list=out_gs)
 
     Q = 30
-    xi = torch.linspace(-10,10, Q).to(device)
+    xi = torch.linspace(0,70,Q).to(device)
     model = MacroToMesoPretrainer(
         d_features=2,
         Q_mesoscale=Q,
