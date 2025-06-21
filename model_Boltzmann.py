@@ -11,13 +11,15 @@ import time
 
 class MacroToMesoEncoder(nn.Module):
     def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, spatial_conv_type: str = 'gaan', 
-                 conv_params: dict = None, is_SGRNN: bool = False):
+                 conv_params: dict = None, is_SGRNN: bool = False, max_macrovelocity: int = 70):
         super(MacroToMesoEncoder, self).__init__()
         self.d_features = d_features
         self.Q_mesoscale = Q_mesoscale
         self.spatial_conv_type = spatial_conv_type
         self.conv_layers = nn.ModuleList()
         self.is_SGRNN = is_SGRNN
+        self.max_macrovelocity = max_macrovelocity
+        self.tol = 0.5
         if spatial_conv_type == 'diffconv':
             k = conv_params.get('k', 2)
             in_graph_list = conv_params.get('in_graph_list', [])
@@ -40,16 +42,99 @@ class MacroToMesoEncoder(nn.Module):
                 raise ValueError(f"Unsupported spatial_conv_type: {spatial_conv_type}")
             
             self.conv_layers.append(conv_layer)
+    
+    def apply_physical_priors(self, x, macro_features):
+        velocities = macro_features[:, 0]  # [N]
+        
+        zero_velocity_mask = (torch.abs(velocities) < self.tol).unsqueeze(1)  # [N, 1]
+        max_velocity_mask = (torch.abs(velocities - self.max_macrovelocity) < self.tol).unsqueeze(1)  # [N, 1]
+        learning_mask = ~(zero_velocity_mask.squeeze(1) | max_velocity_mask.squeeze(1))  # [N]
+        
+        x_modified = torch.zeros_like(x)  # [N, Q]
+        
+        if max_velocity_mask.any():
+            max_vel_indices = max_velocity_mask.squeeze(1)
+            x_modified[max_vel_indices, -1] = self.Q_mesoscale * velocities[max_vel_indices] / self.max_macrovelocity
+        
+        if learning_mask.any():
+            x_modified[learning_mask] = x[learning_mask]
+        
+        return x_modified
 
     def forward(self, graph, macro_features):
         x = macro_features
-        
+
         for i, conv_layer in enumerate(self.conv_layers):
             x = conv_layer(graph, x)
             x = nn.functional.tanh(x) if i < len(self.conv_layers) - 1 else x
         if not self.is_SGRNN:
             x = nn.functional.relu(x)
+        
+        x = self.apply_physical_priors(x, macro_features)
+
         return x
+
+class CollisionOperatorBGK(nn.Module):
+    def __init__(self, Q_mesoscale: int, min_macrovelocity: int = 0, max_macrovelocity: int = 70, hidden_dim: int = 64, num_layers: int = 5):
+        super(CollisionOperatorBGK, self).__init__()
+        self.Q_mesoscale = Q_mesoscale
+        self.min_macrovelocity = min_macrovelocity
+        self.max_macrovelocity = max_macrovelocity
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        self.register_buffer('xi',torch.linspace(min_macrovelocity, max_macrovelocity, Q_mesoscale))
+        self.register_buffer('xi2', self.xi**2)
+        
+        self.tau_mlp = nn.ModuleList()
+        for k1 in range(num_layers):
+            in_dim = 3 if k1 == 0 else hidden_dim # 3 for [velocity, time embedding, node position])
+            out_dim = hidden_dim if k1 < num_layers - 1 else 1
+            self.tau_mlp.append(nn.Linear(in_dim, out_dim))
+        
+    @torch.no_grad()
+    def _solve_lambda_mu(self, macro_velocity, stop_criterion=1e-6, max_iter=100):
+        lambda0 = torch.zeros_like(macro_velocity)
+        xi_1 = self.xi
+        xi_2 = self.xi2
+
+        S0 = torch.exp(lambda0 * xi_1.squeeze(0)).sum(dim=1, keepdim=True)
+        S1 = (torch.exp(lambda0 * xi_1.squeeze(0))*xi_1).sum(dim=1, keepdim=True)
+        S2 = (torch.exp(lambda0 * xi_1.squeeze(0))*xi_2).sum(dim=1, keepdim=True)
+        gprime = (S0*S2 - S1**2) / (S0**2)
+        
+        for_counter = 0
+        while for_counter < max_iter and torch.max(torch.abs(gprime)) > stop_criterion:
+            lambda1 = lambda0 - (S1/S0 - macro_velocity) / gprime
+            S0 = torch.exp(lambda1 * xi_1.squeeze(0)).sum(dim=1, keepdim=True)
+            S1 = (torch.exp(lambda1 * xi_1.squeeze(0))*xi_1).sum(dim=1, keepdim=True)
+            S2 = (torch.exp(lambda1 * xi_1.squeeze(0))*xi_2).sum(dim=1, keepdim=True)
+            gprime = (S0*S2 - S1**2) / (S0**2)
+            lambda0 = lambda1
+            for_counter += 1
+        
+        mu0 = -torch.log(S0)
+
+        return lambda0, mu0
+    
+    def forward(self, f_distribution, macro_features, position_embedding):
+        rho = f_distribution.mean(dim=1, keepdim=True)
+        lambda_sets, mu0_sets = self._solve_lambda_mu(macro_features[...,:1], stop_criterion=1e-3, max_iter=100)
+        f_eq = rho * torch.exp(mu0_sets) * torch.exp(lambda_sets * self.xi.unsqueeze(0))
+        x = torch.cat([macro_features, position_embedding], dim=-1)
+        # print(self.tau_mlp)
+        for i, layer in enumerate(self.tau_mlp):
+            # print(f'x shape: {x.shape}')
+            x = layer(x)
+            if i < len(self.tau_mlp) - 1:
+                x = nn.functional.tanh(x)
+
+        tau = torch.exp(x)
+        omega = - (f_distribution - f_eq) / tau
+
+        return omega
+
+    
 
 
 class CollisionOperator(nn.Module):
@@ -239,7 +324,7 @@ class KineticForecastingFramework(nn.Module):
     def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, min_macrovelocity=0, max_macrovelocity=70, num_layers_macro_to_meso: int = 1,
                  spatial_conv_type: str = 'gaan', conv_params: dict = None,
                  collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6, 
-                 hidden_dim_collision: int = 64, base_graph = None, source_mlp_num_layers: int = 5, source_mlp_hidden_dim: int = 128):
+                 hidden_dim_collision: int = 64, base_graph = None, source_mlp_num_layers: int = 5, source_mlp_hidden_dim: int = 128, is_BGK: bool = True):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
@@ -248,13 +333,14 @@ class KineticForecastingFramework(nn.Module):
         self.decay_steps = decay_steps
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.register_buffer('xi_velocities', torch.linspace(min_macrovelocity, max_macrovelocity, Q_mesoscale, device=device))
+        self.is_BGK = is_BGK
 
         if Q_mesoscale != self.xi_velocities.shape[0]:
             raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({self.xi_velocities.shape[0]})")
         
         self.macro_to_meso = MacroToMesoEncoder(d_features=d_features, Q_mesoscale=Q_mesoscale, num_layers=num_layers_macro_to_meso,
-                                               spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False)
-         
+                                               spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False, max_macrovelocity=max_macrovelocity)
+        
         if base_graph is None:
             raise ValueError("base_graph must be provided for KineticForecastingFramework")
         self.boltzmann_updater = BoltzmannUpdater(Q_mesoscale, dt, min_macrovelocity=min_macrovelocity, max_macrovelocity=max_macrovelocity, base_graph=base_graph)
@@ -263,8 +349,12 @@ class KineticForecastingFramework(nn.Module):
                                    spatial_conv_type=spatial_conv_type,
                                    conv_params=conv_params, is_SGRNN=True, out_num_layers=source_mlp_num_layers, out_hidden_dim=source_mlp_hidden_dim)
         
-        self.collision_op = CollisionOperator(Q_mesoscale, hidden_dim_collision, constraint_type=collision_constraint,
-                                            xi_velocities=self.xi_velocities, num_layers=num_layers_collision)
+        if is_BGK:
+            self.collision_op = CollisionOperatorBGK(Q_mesoscale, min_macrovelocity=min_macrovelocity, max_macrovelocity=max_macrovelocity,
+                                                     hidden_dim=hidden_dim_collision, num_layers=num_layers_collision)
+        else:
+            self.collision_op = CollisionOperator(Q_mesoscale, hidden_dim_collision, constraint_type=collision_constraint,
+                                                xi_velocities=self.xi_velocities, num_layers=num_layers_collision)
         
         self.meso_to_macro = MesoToMacroDecoder(Q_mesoscale, torch.linspace(min_macrovelocity, max_macrovelocity, Q_mesoscale, device=self.device))
         self.source_hidden = None  # Hidden state for source term RNN
@@ -275,7 +365,9 @@ class KineticForecastingFramework(nn.Module):
         )
 
     def forward(self, graph, macro_features_sequence, num_pred_steps: int = 1, 
-                target_sequence: torch.Tensor = None, batch_cnt: int = 0):
+                target_sequence: torch.Tensor = None, batch_cnt: int = 0, node_position: int = None):
+        if node_position is None:
+            raise ValueError("node_position must be provided for KineticForecastingFramework")
         T = macro_features_sequence.shape[0]
         macro_features_sequence = macro_features_sequence.to(self.device)
         target_sequence = target_sequence.to(self.device)
@@ -290,8 +382,11 @@ class KineticForecastingFramework(nn.Module):
             f_current = self.macro_to_meso(graph, current_macro)
             macro_reconstructed = self.meso_to_macro(f_current)
             reconstruction_outputs.append(macro_reconstructed)
-        
-        collision_term = self.collision_op(f_current)
+
+        if self.is_BGK:
+            collision_term = self.collision_op(f_current, current_macro, node_position)
+        else:
+            collision_term = self.collision_op(f_current)
         # collision_term = torch.zeros_like(f_current)
         f_next = self.boltzmann_updater(f_current, collision_term, source_term)
         macro_next = self.meso_to_macro(f_next)
@@ -307,7 +402,10 @@ class KineticForecastingFramework(nn.Module):
                 source_input = torch.cat([macro_next,target_sequence[step][...,1:]],dim=-1)
             source_term, self.source_hidden = self.source_rnn(graph, source_input, 
                                                               self.source_hidden)
-            collision_term = self.collision_op(f_current)
+            if self.is_BGK:
+                collision_term = self.collision_op(f_current, source_input, node_position)
+            else:
+                collision_term = self.collision_op(f_current)
             # collision_term = torch.zeros_like(f_current)
 
             f_next = self.boltzmann_updater(f_current, collision_term, source_term)

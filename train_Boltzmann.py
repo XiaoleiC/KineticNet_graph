@@ -2,7 +2,9 @@ import argparse
 from functools import partial
 
 import dgl
-
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,6 +24,7 @@ from gaan import GatedGAT
 from model_Boltzmann import KineticForecastingFramework as GraphRNN
 from torch.utils.data import DataLoader
 from utils import get_learning_rate, masked_mae_loss, NormalizationLayer
+import os
 
 batch_cnt = [0]
 
@@ -35,6 +38,7 @@ def train(
     normalizer,
     loss_fn,
     device,
+    node_position_batch,
     args,
 ):
     predict_loss = []
@@ -85,7 +89,7 @@ def train(
         #         f"Shape mismatch: x_norm {x_norm.shape} vs y_norm {y_norm.shape}"
         #     )
 
-        output, reconstruct = model(graph=graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0])
+        output, reconstruct = model(graph=graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0], node_position=node_position_batch)
         loss_predict = loss_fn(output, y[...,:1])
         loss_reconstruct = loss_fn(reconstruct, x[...,:1])
         loss = loss_predict + loss_reconstruct
@@ -103,10 +107,28 @@ def train(
         # print(f'\nPredicted Velocity of Node 0: {output[:,0,0]}')
         # print(f'\nTarget Reconstructed Velocity of Node 0: {x[:,0,0]}')
         # print(f'\nPredicted Reconstructed Velocity of Node 0: {reconstruct[:,0,0]}')
+    for node_id in range(0, 100):
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        ax[1].plot(output[:,node_id,0].detach().cpu().numpy(), label='Predicted Velocity')
+        ax[1].plot(y[:,node_id,0].detach().cpu().numpy(), label='Target Velocity')
+        ax[1].set_title(f'Node {node_id} - Predict')
+        ax[0].plot(reconstruct[:,node_id,0].detach().cpu().numpy(), label='Predicted Reconstructed Velocity')
+        ax[0].plot(x[:,node_id,0].detach().cpu().numpy(), label='Target Reconstructed Velocity')
+        ax[0].set_title(f'Node {node_id} - Reconstructed')
+        ax[0].legend()
+        ax[1].legend()
+        save_dir = os.path.join("figures", "train")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'train_predicted_vs_target_velocity_{node_id}.png')
+        fig.savefig(save_path)
+        plt.close(fig)
+    print('training figures saved...')
+
+
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
-def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
+def eval(model, graph, dataloader, normalizer, loss_fn, device, node_position_batch, args):
     predict_loss = []
     reconstructed_loss = []
     graph = graph.to(device)
@@ -149,11 +171,28 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
         y = y.reshape(y.shape[0], -1, y.shape[3]).float().to(device)
 
         # batch_graph = dgl.batch([graph] * batch_size)
-        output, y_reconstruct = model(graph = graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0])
+        output, y_reconstruct = model(graph = graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0], node_position=node_position_batch)
         loss_predict = loss_fn(output, y[...,:1])
         loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
         predict_loss.append(float(loss_predict))
         reconstructed_loss.append(float(loss_reconstruct))
+    for node_id in range(0, 100):
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        ax[1].plot(output[:,node_id,0].detach().cpu().numpy(), label='Predicted Velocity')
+        ax[1].plot(y[:,node_id,0].detach().cpu().numpy(), label='Target Velocity')
+        ax[1].set_title(f'Node {node_id} - Predict')
+        ax[0].plot(y_reconstruct[:,node_id,0].detach().cpu().numpy(), label='Predicted Reconstructed Velocity')
+        ax[0].plot(x[:,node_id,0].detach().cpu().numpy(), label='Target Reconstructed Velocity')
+        ax[0].set_title(f'Node {node_id} - Reconstructed')
+        ax[0].legend()
+        ax[1].legend()
+        save_dir = os.path.join("figures", "eval")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'eval_predicted_vs_target_velocity_{node_id}.png')
+        fig.savefig(save_path)
+        plt.close(fig)
+
+    print('evaluation figures saved...')
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
@@ -205,7 +244,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--minimum_lr",
         type=float,
-        default=1e-7,
+        default=2e-6,
         help="Lower bound of learning rate",
     )
     parser.add_argument(
@@ -285,6 +324,8 @@ if __name__ == "__main__":
     # elif args.model == "gaan":
     #     net = partial(GatedGAT, map_feats=64, num_heads=args.num_heads)
 
+    node_position = torch.arange(g.num_nodes()).float().unsqueeze(1).to(device)
+    node_position_batch0 = node_position.repeat(args.batch_size,1)
     batch_g = dgl.batch([g] * args.batch_size).to(device)
 
     # k = 2
@@ -303,8 +344,8 @@ if __name__ == "__main__":
     max_macrovelocity = 70
 
     num_macro_to_meso_layers = 1
-    num_layers_collision = 10
-    hidden_dim_collision = 128
+    num_layers_collision = 5
+    hidden_dim_collision = 64
     source_mlp_num_layers = 10
     source_mlp_hidden_dim = 128
 
@@ -326,9 +367,11 @@ if __name__ == "__main__":
         base_graph= batch_g,
         source_mlp_num_layers=source_mlp_num_layers,
         source_mlp_hidden_dim=source_mlp_hidden_dim,
+        is_BGK=True
     ).to(device)
 
-    optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)
+    # optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(dcrnn.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
 
     loss_fn = masked_mae_loss
@@ -348,13 +391,14 @@ if __name__ == "__main__":
             normalizer,
             loss_fn,
             device,
+            node_position_batch0,
             args,
         )
         valid_loss_predict, valid_loss_reconstruct = eval(
-            dcrnn, batch_g, valid_loader, normalizer, loss_fn, device, args
+            dcrnn, batch_g, valid_loader, normalizer, loss_fn, device, node_position_batch0, args
         )
         test_loss_predict, test_loss_reconstruct = eval(
-            dcrnn, batch_g, test_loader, normalizer, loss_fn, device, args
+            dcrnn, batch_g, test_loader, normalizer, loss_fn, device, node_position_batch0, args
         )
         print(
             "\rEpoch: {} Train Loss Predict: {:.4f} Valid Loss Predict: {:.4f} Test Loss Predict: {:.4f}".format(
