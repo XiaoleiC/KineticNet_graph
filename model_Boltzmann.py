@@ -9,6 +9,46 @@ from gaan import GatedGAT
 from functools import partial
 import time
 
+class MacroToMesoEncoderTrafficFluid(nn.Module):
+    def __init__(self, Q_mesoscale: int, min_macrovelcity: int = 0, max_macrovelocity: int = 70):
+        super(MacroToMesoEncoderTrafficFluid, self).__init__()
+        self.Q_mesoscale = Q_mesoscale
+        self.min_macrovelcity = min_macrovelcity
+        self.max_macrovelocity = max_macrovelocity
+        self.register_buffer('xi', torch.linspace(min_macrovelcity, max_macrovelocity, Q_mesoscale))
+        self.register_buffer('xi2', self.xi**2)
+        self.register_buffer('weights', torch.ones(Q_mesoscale) / Q_mesoscale)
+
+    @torch.no_grad()
+    def _solve_lambda_mu(self, macro_velocity, stop_criterion=1e-6, max_iter=100):
+        lambda0 = torch.zeros_like(macro_velocity)
+        xi_1 = self.xi
+        xi_2 = self.xi2
+
+        S0 = torch.exp(lambda0 * xi_1.squeeze(0)).sum(dim=1, keepdim=True)
+        S1 = (torch.exp(lambda0 * xi_1.squeeze(0))*xi_1).sum(dim=1, keepdim=True)
+        S2 = (torch.exp(lambda0 * xi_1.squeeze(0))*xi_2).sum(dim=1, keepdim=True)
+        gprime = (S0*S2 - S1**2) / (S0**2)
+        
+        for_counter = 0
+        while for_counter < max_iter and torch.max(torch.abs(gprime)) > stop_criterion:
+            lambda1 = lambda0 - (S1/S0 - macro_velocity) / gprime
+            S0 = torch.exp(lambda1 * xi_1.squeeze(0)).sum(dim=1, keepdim=True)
+            S1 = (torch.exp(lambda1 * xi_1.squeeze(0))*xi_1).sum(dim=1, keepdim=True)
+            S2 = (torch.exp(lambda1 * xi_1.squeeze(0))*xi_2).sum(dim=1, keepdim=True)
+            gprime = (S0*S2 - S1**2) / (S0**2)
+            lambda0 = lambda1
+            for_counter += 1
+        
+        mu0 = -torch.log(S0)
+
+        return lambda0, mu0
+    
+    def forward(self, macro_velocity):
+        lambda_sets, mu0_sets = self._solve_lambda_mu(macro_velocity, stop_criterion=1e-3, max_iter=100)
+        f_eq = torch.exp(mu0_sets) * torch.exp(lambda_sets * self.xi.unsqueeze(0))
+        return f_eq
+
 class MacroToMesoEncoder(nn.Module):
     def __init__(self, d_features: int, Q_mesoscale: int, num_layers: int = 1, spatial_conv_type: str = 'gaan', 
                  conv_params: dict = None, is_SGRNN: bool = False, max_macrovelocity: int = 70):
@@ -305,7 +345,6 @@ class MesoToMacroDecoder(nn.Module):
         self.register_buffer('weights', torch.ones(Q_mesoscale) / Q_mesoscale)
     
     def forward(self, f_distribution):
-        N = f_distribution.shape[0]
         macro_variables = []
         xi_broadcast = self.xi_velocities.unsqueeze(0)
         density = torch.sum(f_distribution * self.weights, dim=1, keepdim=True)
@@ -324,7 +363,7 @@ class KineticForecastingFramework(nn.Module):
     def __init__(self, d_features: int, d_features_source: int, Q_mesoscale: int, min_macrovelocity=0, max_macrovelocity=70, num_layers_macro_to_meso: int = 1,
                  spatial_conv_type: str = 'gaan', conv_params: dict = None,
                  collision_constraint: str = 'none', dt: float = 0.1, decay_steps: int = 2000, device: Optional[Union[str, torch.device]] = 'cpu', num_layers_collision: int = 6, 
-                 hidden_dim_collision: int = 64, base_graph = None, source_mlp_num_layers: int = 5, source_mlp_hidden_dim: int = 128, is_BGK: bool = True):
+                 hidden_dim_collision: int = 64, base_graph = None, source_mlp_num_layers: int = 5, source_mlp_hidden_dim: int = 128, is_BGK: bool = True, is_using_feq: bool = True):
         super(KineticForecastingFramework, self).__init__()
         
         self.d_features = d_features
@@ -334,11 +373,15 @@ class KineticForecastingFramework(nn.Module):
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.register_buffer('xi_velocities', torch.linspace(min_macrovelocity, max_macrovelocity, Q_mesoscale, device=device))
         self.is_BGK = is_BGK
+        self.is_using_feq = is_using_feq
 
         if Q_mesoscale != self.xi_velocities.shape[0]:
             raise ValueError(f"Q_mesoscale ({Q_mesoscale}) must match xi_velocities length ({self.xi_velocities.shape[0]})")
         
-        self.macro_to_meso = MacroToMesoEncoder(d_features=d_features, Q_mesoscale=Q_mesoscale, num_layers=num_layers_macro_to_meso,
+        if is_using_feq:
+            self.macro_to_meso = MacroToMesoEncoderTrafficFluid(Q_mesoscale, min_macrovelcity=min_macrovelocity, max_macrovelocity=max_macrovelocity)
+        else:
+            self.macro_to_meso = MacroToMesoEncoder(d_features=d_features, Q_mesoscale=Q_mesoscale, num_layers=num_layers_macro_to_meso,
                                                spatial_conv_type=spatial_conv_type, conv_params=conv_params, is_SGRNN=False, max_macrovelocity=max_macrovelocity)
         
         if base_graph is None:
@@ -379,7 +422,10 @@ class KineticForecastingFramework(nn.Module):
         for t in range(T):
             current_macro = macro_features_sequence[t]
             source_term, self.source_hidden = self.source_rnn(graph, current_macro, self.source_hidden)
-            f_current = self.macro_to_meso(graph, current_macro)
+            if self.is_using_feq:
+                f_current = self.macro_to_meso(current_macro[...,:1])
+            else:
+                f_current = self.macro_to_meso(graph, current_macro)
             macro_reconstructed = self.meso_to_macro(f_current)
             reconstruction_outputs.append(macro_reconstructed)
 
@@ -395,7 +441,10 @@ class KineticForecastingFramework(nn.Module):
         for step in range(num_pred_steps-1):
             if (self.training and target_sequence is not None and 
                 np.random.random() < teacher_forcing_threshold):
-                f_current = self.macro_to_meso(graph, target_sequence[step])
+                if self.is_using_feq:
+                    f_current = self.macro_to_meso(target_sequence[step][...,:1])
+                else:
+                    f_current = self.macro_to_meso(graph, target_sequence[step])
                 source_input = target_sequence[step]
             else:
                 f_current = f_next

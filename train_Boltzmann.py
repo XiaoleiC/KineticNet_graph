@@ -339,15 +339,15 @@ if __name__ == "__main__":
         'num_heads': args.num_heads if args.model == "gaan" else None,
     }
     
-    Q_mesoscale = 71
+    Q_mesoscale = 20
     min_macrovelocity = 0
     max_macrovelocity = 70
 
     num_macro_to_meso_layers = 1
     num_layers_collision = 5
     hidden_dim_collision = 64
-    source_mlp_num_layers = 10
-    source_mlp_hidden_dim = 128
+    source_mlp_num_layers = 8
+    source_mlp_hidden_dim = 64
 
     dcrnn = GraphRNN(
         d_features=2,
