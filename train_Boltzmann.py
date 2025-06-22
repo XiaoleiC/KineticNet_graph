@@ -339,7 +339,7 @@ if __name__ == "__main__":
         'num_heads': args.num_heads if args.model == "gaan" else None,
     }
     
-    Q_mesoscale = 20
+    Q_mesoscale = 71
     min_macrovelocity = 0
     max_macrovelocity = 70
 
@@ -367,7 +367,8 @@ if __name__ == "__main__":
         base_graph= batch_g,
         source_mlp_num_layers=source_mlp_num_layers,
         source_mlp_hidden_dim=source_mlp_hidden_dim,
-        is_BGK=True
+        is_BGK=True,
+        is_using_feq=False
     ).to(device)
 
     # optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)
