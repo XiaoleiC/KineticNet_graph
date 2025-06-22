@@ -28,6 +28,86 @@ import os
 
 batch_cnt = [0]
 
+def save_checkpoint(model, optimizer, scheduler, epoch, batch_cnt, loss, checkpoint_dir, is_best=False):
+    """Save model checkpoint"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint = {
+        'epoch': epoch,
+        'batch_cnt': batch_cnt,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': loss,
+    }
+    
+    # Save regular checkpoint
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved at {checkpoint_path}")
+    
+    # Save as latest checkpoint
+    latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
+    torch.save(checkpoint, latest_path)
+    
+    # Save best model if specified
+    if is_best:
+        best_path = os.path.join(checkpoint_dir, 'best_model.pth')
+        torch.save(checkpoint, best_path)
+        print(f"Best model saved at {best_path}")
+
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
+    """Load model checkpoint"""
+    if os.path.isfile(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        batch_cnt[0] = checkpoint.get('batch_cnt', 0)
+        loss = checkpoint['loss']
+        
+        print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch}")
+        return start_epoch, loss
+    else:
+        print(f"No checkpoint found at {checkpoint_path}")
+        return 0, float('inf')
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in the directory"""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    
+    # First try to find latest_checkpoint.pth
+    latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
+    if os.path.exists(latest_path):
+        return latest_path
+    
+    # Otherwise find the checkpoint with highest epoch number
+    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*.pth'))
+    if not checkpoint_files:
+        return None
+    
+    # Extract epoch numbers and find the maximum
+    epoch_numbers = []
+    for file in checkpoint_files:
+        try:
+            epoch_num = int(file.split('checkpoint_epoch_')[1].split('.pth')[0])
+            epoch_numbers.append((epoch_num, file))
+        except:
+            continue
+    
+    if epoch_numbers:
+        latest_file = max(epoch_numbers, key=lambda x: x[0])[1]
+        return latest_file
+    
+    return None
+
 
 def train(
     model,
@@ -122,7 +202,7 @@ def train(
         save_path = os.path.join(save_dir, f'train_predicted_vs_target_velocity_{node_id}.png')
         fig.savefig(save_path)
         plt.close(fig)
-    print('training figures saved...')
+    print('\ntraining figures saved...')
 
 
     return np.mean(predict_loss), np.mean(reconstructed_loss)
@@ -171,7 +251,8 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, node_position_ba
         y = y.reshape(y.shape[0], -1, y.shape[3]).float().to(device)
 
         # batch_graph = dgl.batch([graph] * batch_size)
-        output, y_reconstruct = model(graph = graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0], node_position=node_position_batch)
+        with torch.no_grad():
+            output, y_reconstruct = model(graph = graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0], node_position=node_position_batch)
         loss_predict = loss_fn(output, y[...,:1])
         loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
         predict_loss.append(float(loss_predict))
@@ -192,7 +273,7 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, node_position_ba
         fig.savefig(save_path)
         plt.close(fig)
 
-    print('evaluation figures saved...')
+    print('\nevaluation figures saved...')
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
@@ -244,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--minimum_lr",
         type=float,
-        default=2e-6,
+        default=1e-6,
         help="Lower bound of learning rate",
     )
     parser.add_argument(
@@ -261,6 +342,23 @@ if __name__ == "__main__":
         type=float,
         default=5.0,
         help="Maximum gradient norm for update parameters",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="trainedmodel",
+        help="Directory to save/load model checkpoints",
+    )
+    parser.add_argument(
+        "--save_freq",
+        type=int,
+        default=2,
+        help="Save checkpoint every N epochs",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from latest checkpoint",
     )
     args = parser.parse_args()
     # Load the datasets
@@ -382,7 +480,20 @@ if __name__ == "__main__":
     trainable_params = sum(p.numel() for p in dcrnn.parameters() if p.requires_grad)
     print(f"Trainable number of parameters: {trainable_params}")
 
-    for e in range(args.epochs):
+    start_epoch = 0
+    best_loss = float('inf')
+
+    if args.resume or os.path.exists(args.checkpoint_dir):
+        latest_checkpoint = find_latest_checkpoint(args.checkpoint_dir)
+        if latest_checkpoint:
+            start_epoch, best_loss = load_checkpoint(dcrnn, optimizer, scheduler, latest_checkpoint)
+        else:
+            print(f"No checkpoint found in {args.checkpoint_dir}, starting from scratch")
+    
+    print(f"Starting training from epoch {start_epoch}")
+
+
+    for e in range(start_epoch, args.epochs):
         train_loss_predict, train_loss_reconstruct = train(
             dcrnn,
             batch_g,
@@ -411,3 +522,20 @@ if __name__ == "__main__":
                 e, train_loss_reconstruct, valid_loss_reconstruct, test_loss_reconstruct
             )
         )
+
+        current_loss = valid_loss_predict + valid_loss_reconstruct
+        is_best = current_loss < best_loss
+        if is_best:
+            best_loss = current_loss
+        
+        if (e + 1) % args.save_freq == 0 or is_best or e == args.epochs - 1:
+            save_checkpoint(
+                dcrnn, 
+                optimizer, 
+                scheduler, 
+                e, 
+                batch_cnt[0], 
+                current_loss, 
+                args.checkpoint_dir, 
+                is_best=is_best
+            )
