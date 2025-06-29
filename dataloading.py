@@ -47,8 +47,8 @@ def METR_LAGraphDataset():
             os.mkdir("data")
         download_file("graph_la.bin")
     # print('graph exists')
-    # g, _ = dgl.load_graphs("data/graph_la.bin")
-    g, _ = dgl.load_graphs("data/graph_la2.bin")
+    g, _ = dgl.load_graphs("data/graph_la.bin")
+    # g, _ = dgl.load_graphs("data/graph_la2.bin")
     return g[0]
 
 

@@ -1,6 +1,9 @@
 import argparse
 from functools import partial
-
+import os
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")
 import dgl
 
 import numpy as np
@@ -89,6 +92,19 @@ def train(
         batch_cnt[0] += 1
         # print("\rBatch: ", i, end="")
         print(f"\rBatch: {i} Loss: {loss:.4f}", end="")
+    for node_id in range(0, 100):
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+        ax.plot(y_pred[:,node_id,0].detach().cpu().numpy(), label='Predicted Velocity')
+        ax.plot(y[:,node_id,0].detach().cpu().numpy(), label='Target Velocity')
+        ax.set_title(f'Node {node_id} - Predict')
+        ax.legend()
+        save_dir = os.path.join("origin_figures", "train")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'train_predicted_vs_target_velocity_{node_id}.png')
+        fig.savefig(save_path)
+        plt.close(fig)
+    print('\ntraining figures saved...')
+
     return np.mean(total_loss)
 
 
@@ -136,6 +152,18 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, args):
         y_pred = normalizer.denormalize(output)
         loss = loss_fn(y_pred, y)
         total_loss.append(float(loss))
+    # for node_id in range(0, 100):
+    #     fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    #     ax.plot(y_pred[:,node_id,0].detach().cpu().numpy(), label='Predicted Velocity')
+    #     ax.plot(y[:,node_id,0].detach().cpu().numpy(), label='Target Velocity')
+    #     ax.set_title(f'Node {node_id} - Predict')
+    #     ax.legend()
+    #     save_dir = os.path.join("origin_figures", "eval")
+    #     os.makedirs(save_dir, exist_ok=True)
+    #     save_path = os.path.join(save_dir, f'eval_predicted_vs_target_velocity_{node_id}.png')
+    #     fig.savefig(save_path)
+    #     plt.close(fig)
+    # print('\neval figures saved...')
     return np.mean(total_loss)
 
 
@@ -157,7 +185,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="gaan",
+        default="dcrnn",
         help="WHich model to use DCRNN vs GaAN",
     )
     parser.add_argument(

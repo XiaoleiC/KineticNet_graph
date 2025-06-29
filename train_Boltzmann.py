@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use("Agg")
 import numpy as np
 import torch
+torch.autograd.set_detect_anomaly(True)
 import torch.nn as nn
 from dataloading import (
     METR_LAGraphDataset,
@@ -172,7 +173,7 @@ def train(
         output, reconstruct = model(graph=graph, macro_features_sequence=x, num_pred_steps=x.shape[0], target_sequence=y, batch_cnt = batch_cnt[0], node_position=node_position_batch)
         loss_predict = loss_fn(output, y[...,:1])
         loss_reconstruct = loss_fn(reconstruct, x[...,:1])
-        loss = loss_predict + loss_reconstruct
+        loss = loss_predict  + loss_reconstruct
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
@@ -257,23 +258,23 @@ def eval(model, graph, dataloader, normalizer, loss_fn, device, node_position_ba
         loss_reconstruct = loss_fn(y_reconstruct, x[...,:1])
         predict_loss.append(float(loss_predict))
         reconstructed_loss.append(float(loss_reconstruct))
-    for node_id in range(0, 100):
-        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
-        ax[1].plot(output[:,node_id,0].detach().cpu().numpy(), label='Predicted Velocity')
-        ax[1].plot(y[:,node_id,0].detach().cpu().numpy(), label='Target Velocity')
-        ax[1].set_title(f'Node {node_id} - Predict')
-        ax[0].plot(y_reconstruct[:,node_id,0].detach().cpu().numpy(), label='Predicted Reconstructed Velocity')
-        ax[0].plot(x[:,node_id,0].detach().cpu().numpy(), label='Target Reconstructed Velocity')
-        ax[0].set_title(f'Node {node_id} - Reconstructed')
-        ax[0].legend()
-        ax[1].legend()
-        save_dir = os.path.join("figures", "eval")
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f'eval_predicted_vs_target_velocity_{node_id}.png')
-        fig.savefig(save_path)
-        plt.close(fig)
+    # for node_id in range(0, 100):
+    #     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    #     ax[1].plot(output[:,node_id,0].detach().cpu().numpy(), label='Predicted Velocity')
+    #     ax[1].plot(y[:,node_id,0].detach().cpu().numpy(), label='Target Velocity')
+    #     ax[1].set_title(f'Node {node_id} - Predict')
+    #     ax[0].plot(y_reconstruct[:,node_id,0].detach().cpu().numpy(), label='Predicted Reconstructed Velocity')
+    #     ax[0].plot(x[:,node_id,0].detach().cpu().numpy(), label='Target Reconstructed Velocity')
+    #     ax[0].set_title(f'Node {node_id} - Reconstructed')
+    #     ax[0].legend()
+    #     ax[1].legend()
+    #     save_dir = os.path.join("figures", "eval")
+    #     os.makedirs(save_dir, exist_ok=True)
+    #     save_path = os.path.join(save_dir, f'eval_predicted_vs_target_velocity_{node_id}.png')
+    #     fig.savefig(save_path)
+    #     plt.close(fig)
 
-    print('\nevaluation figures saved...')
+    # print('\nevaluation figures saved...')
     return np.mean(predict_loss), np.mean(reconstructed_loss)
 
 
@@ -308,7 +309,7 @@ if __name__ == "__main__":
         help="Step of constructing the diffusiob matrix",
     )
     parser.add_argument(
-        "--num_heads", type=int, default=6, help="Number of multiattention head"
+        "--num_heads", type=int, default=10, help="Number of multiattention head"
     )
     parser.add_argument(
         "--map_feats", type=int, default=128
@@ -320,7 +321,7 @@ if __name__ == "__main__":
         help="Teacher forcing probability decay ratio",
     )
     parser.add_argument(
-        "--lr", type=float, default=0.01, help="Initial learning rate"
+        "--lr", type=float, default=1e-2, help="Initial learning rate"
     )
     parser.add_argument(
         "--minimum_lr",
@@ -420,14 +421,15 @@ if __name__ == "__main__":
     #         out_graph_list=out_gs,
     #     )
     # elif args.model == "gaan":
-    #     net = partial(GatedGAT, map_feats=64, num_heads=args.num_heads)
+    #     net = partial(GatedGAT, map_feats=args.map_feats, num_heads=args.num_heads)
 
-    node_position = torch.arange(g.num_nodes()).float().unsqueeze(1).to(device)
+    node_position = torch.linspace(0,1,g.num_nodes()).float().unsqueeze(1).to(device)
     node_position_batch0 = node_position.repeat(args.batch_size,1)
     batch_g = dgl.batch([g] * args.batch_size).to(device)
 
-    # k = 2
-    # out_graph_list, in_graph_list = DiffConv.attach_graph(batch_g, k)
+    k = args.diffsteps
+    out_graph_list, in_graph_list = DiffConv.attach_graph(batch_g, k)
+    net = partial(DiffConv, k=k, in_graph_list=in_graph_list, out_graph_list=out_graph_list)
 
     conv_params = {
         # "k": 2,
@@ -437,14 +439,14 @@ if __name__ == "__main__":
         'num_heads': args.num_heads if args.model == "gaan" else None,
     }
     
-    Q_mesoscale = 71
+    Q_mesoscale = 30
     min_macrovelocity = 0
     max_macrovelocity = 70
 
     num_macro_to_meso_layers = 1
-    num_layers_collision = 5
+    num_layers_collision = 4
     hidden_dim_collision = 64
-    source_mlp_num_layers = 8
+    source_mlp_num_layers = 2
     source_mlp_hidden_dim = 64
 
     dcrnn = GraphRNN(
@@ -466,7 +468,9 @@ if __name__ == "__main__":
         source_mlp_num_layers=source_mlp_num_layers,
         source_mlp_hidden_dim=source_mlp_hidden_dim,
         is_BGK=True,
-        is_using_feq=False
+        is_using_feq=True,
+        net_source=None,
+        zero_inputs = torch.zeros(batch_g.num_nodes(), 2).to(device)
     ).to(device)
 
     # optimizer = torch.optim.Adam(dcrnn.parameters(), lr=args.lr)
@@ -528,14 +532,14 @@ if __name__ == "__main__":
         if is_best:
             best_loss = current_loss
         
-        if (e + 1) % args.save_freq == 0 or is_best or e == args.epochs - 1:
-            save_checkpoint(
-                dcrnn, 
-                optimizer, 
-                scheduler, 
-                e, 
-                batch_cnt[0], 
-                current_loss, 
-                args.checkpoint_dir, 
-                is_best=is_best
-            )
+        # if (e + 1) % args.save_freq == 0 or is_best or e == args.epochs - 1:
+        #     save_checkpoint(
+        #         dcrnn, 
+        #         optimizer, 
+        #         scheduler, 
+        #         e, 
+        #         batch_cnt[0], 
+        #         current_loss, 
+        #         args.checkpoint_dir, 
+        #         is_best=is_best
+        #     )

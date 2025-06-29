@@ -228,3 +228,45 @@ class GraphRNN(nn.Module):
         hidden = self.encode(g, inputs, device)
         outputs = self.decode(g, teacher_states, hidden, batch_cnt, device)
         return outputs
+
+
+class SourceGraphRNN(nn.Module):
+    def __init__(
+        self, in_feats, hidden_feats, Q_mesoscale, num_layers, net):
+        super(SourceGraphRNN, self).__init__()
+        self.in_feats = in_feats
+        self.hidden_feats = hidden_feats
+        self.Q_mesoscale = Q_mesoscale
+        self.num_layers = num_layers
+        self.net = net
+
+        self.encoder = StackedEncoder(
+            self.in_feats, self.hidden_feats, self.num_layers, self.net
+        )
+
+        self.decoder = StackedDecoder(
+            self.in_feats,
+            self.hidden_feats,
+            self.Q_mesoscale,
+            self.num_layers,
+            self.net,
+        )
+
+    def encode(self, g, inputs, hidden_states, device):
+        if hidden_states is None:
+            hidden_states = [
+                torch.zeros(g.num_nodes(), self.hidden_feats).to(device)
+                for _ in range(self.num_layers)
+            ]
+        _, hidden_states = self.encoder(g, inputs, hidden_states)
+
+        return hidden_states
+
+    def decode(self, g, zero_inputs, hidden_states):
+        outputs, hidden_states = self.decoder(g, zero_inputs, hidden_states)
+        return outputs
+
+    def forward(self, g, inputs, zero_inputs, hidden_states, device):
+        hidden = self.encode(g, inputs, hidden_states, device)
+        outputs = self.decode(g, zero_inputs, hidden)
+        return outputs, hidden
