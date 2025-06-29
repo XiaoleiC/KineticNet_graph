@@ -30,7 +30,7 @@ Performance on METR-LA
 | DCRNN paper     | 3.17 |
 | GaAN in DGL     | 3.20 |
 | GaAN paper      | 3.16 |
-| KineticNet      | 5.68 |
+| KineticNet      | 4.01 |
 
 *Currently the number of trainable parameters in KineticNet is only 1/7 of DCRNN and 1/20 of GaAN, I am fine-tuning.*
 
