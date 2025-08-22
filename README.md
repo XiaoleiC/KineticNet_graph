@@ -1,5 +1,5 @@
 # Kinetic Theory-informed Graph Learning for Traffic Forecasting
-## DGL Implementation of KineticNet (ours), DCRNN and GaAN paper.
+## DGL Implementation of KineticNet (ours), DCRNN, and GaAN paper.
 ## Still Under Testing. ##
 
 Verify our proposed KineticNet. We also implement the GNN model proposed in the paper [Diffusion Convolutional Recurrent Neural Network: Data-Driven Traffic Forecasting](https://arxiv.org/abs/1707.01926) and [GaAN:Gated Attention Networks for Learning on Large and Spatiotemporal Graphs](https://arxiv.org/pdf/1803.07294).
@@ -31,8 +31,9 @@ Performance on METR-LA
 | DCRNN paper     | 3.17 |
 | GaAN in DGL     | 3.20 |
 | GaAN paper      | 3.16 |
-| KineticNet      | 4.00 |
+| KineticNet      | 3.31 |
 
-*Currently the number of trainable parameters in KineticNet is only 1/7 of DCRNN and 1/20 of GaAN, I am fine-tuning.*
+*Currently, the number of trainable parameters in KineticNet is only 1/7 of DCRNN and 1/20 of GaAN. I am doing hyperparameter tuning now.*
 
-Notice that Any Graph Convolution module can be plugged into the recurrent discrete temporal dynamic graph template to test performance; simply replace DiffConv or GaAN.
+Notice that any Graph Convolution module can be plugged into the recurrent discrete temporal dynamic graph template to test performance; simply replace DiffConv or GaAN.
+
