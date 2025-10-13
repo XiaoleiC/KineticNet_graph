@@ -31,9 +31,10 @@ Performance on METR-LA
 | DCRNN paper     | 3.17 |
 | GaAN in DGL     | 3.20 |
 | GaAN paper      | 3.16 |
-| KineticNet      | 3.31 |
+| KineticNet (ours) | 3.31 |
 
 *Currently, the number of trainable parameters in KineticNet is only 1/7 of DCRNN and 1/20 of GaAN. I am doing hyperparameter tuning now.*
 
 Notice that any Graph Convolution module can be plugged into the recurrent discrete temporal dynamic graph template to test performance; simply replace DiffConv or GaAN.
+
 
